@@ -1,5 +1,5 @@
 {
-  "name": "@codemirror/view",
+  "name": "@craftzdog/cm6-view",
   "version": "0.19.7",
   "description": "DOM view component for the CodeMirror code editor",
   "scripts": {
