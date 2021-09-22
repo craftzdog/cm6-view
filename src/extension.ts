@@ -1,11 +1,11 @@
-import {EditorState, Transaction, ChangeSet, Facet, StateEffect, Extension, SelectionRange} from "@codemirror/state"
-import {RangeSet} from "@codemirror/rangeset"
-import {StyleModule} from "style-mod"
-import {DecorationSet} from "./decoration"
-import {EditorView, DOMEventHandlers} from "./editorview"
-import {Attrs, combineAttrs} from "./attributes"
-import {Rect} from "./dom"
-import {MakeSelectionStyle} from "./input"
+import { EditorState, Transaction, ChangeSet, Facet, StateEffect, Extension, SelectionRange } from "@codemirror/state"
+import { RangeSet } from "@codemirror/rangeset"
+import { StyleModule } from "style-mod"
+import { DecorationSet } from "./decoration"
+import { EditorView, DOMEventHandlers } from "./editorview"
+import { Attrs, combineAttrs } from "./attributes"
+import { Rect } from "./dom"
+import { MakeSelectionStyle } from "./input"
 
 /// Command functions are used in key bindings and other types of user
 /// actions. Given an editor view, they check whether their effect can
@@ -50,7 +50,7 @@ export function logException(state: EditorState, exception: any, context?: strin
   else console.error(exception)
 }
 
-export const editable = Facet.define<boolean, boolean>({combine: values => values.length ? values[0] : true })
+export const editable = Facet.define<boolean, boolean>({ combine: values => values.length ? values[0] : true })
 
 /// This is the interface plugin objects conform to.
 export interface PluginValue {
@@ -84,7 +84,7 @@ export class PluginFieldProvider<V> {
     readonly field: PluginField<any>,
     /// @internal
     readonly get: (value: V) => any
-  ) {}
+  ) { }
 }
 
 /// Plugin fields are a mechanism for allowing plugins to provide
@@ -181,19 +181,19 @@ export class ViewPlugin<V extends PluginValue> {
   /// Define a plugin from a constructor function that creates the
   /// plugin's value, given an editor view.
   static define<V extends PluginValue>(create: (view: EditorView) => V, spec?: PluginSpec<V>) {
-    let {eventHandlers, provide, decorations} = spec || {}
+    let { eventHandlers, provide, decorations } = spec || {}
     let fields = []
     if (provide) for (let provider of Array.isArray(provide) ? provide : [provide])
       fields.push(provider)
     if (eventHandlers)
-      fields.push(domEventHandlers.from((value: V) => ({plugin: value, handlers: eventHandlers} as any)))
+      fields.push(domEventHandlers.from((value: V) => ({ plugin: value, handlers: eventHandlers } as any)))
     if (decorations) fields.push(PluginField.decorations.from(decorations))
     return new ViewPlugin<V>(nextPluginID++, create, fields)
   }
 
   /// Create a plugin for a class whose constructor takes a single
   /// editor view as argument.
-  static fromClass<V extends PluginValue>(cls: {new (view: EditorView): V}, spec?: PluginSpec<V>) {
+  static fromClass<V extends PluginValue>(cls: { new(view: EditorView): V }, spec?: PluginSpec<V>) {
     return ViewPlugin.define(view => new cls(view), spec)
   }
 }
@@ -213,10 +213,10 @@ export class PluginInstance {
   // initialized on the first update.
   value: PluginValue | null = null
 
-  constructor(readonly spec: ViewPlugin<any>) {}
+  constructor(readonly spec: ViewPlugin<any>) { }
 
   takeField<T>(type: PluginField<T>, target: T[]) {
-    for (let {field, get} of this.spec.fields) if (field == type) target.push(get(this.value))
+    for (let { field, get } of this.spec.fields) if (field == type) target.push(get(this.value))
   }
 
   update(view: EditorView) {
@@ -234,7 +234,7 @@ export class PluginInstance {
         this.value.update(update)
       } catch (e) {
         logException(update.state, e, "CodeMirror plugin crashed")
-        if (this.value.destroy) try { this.value.destroy() } catch (_) {}
+        if (this.value.destroy) try { this.value.destroy() } catch (_) { }
         return PluginInstance.dummy
       }
     }
@@ -279,11 +279,11 @@ export const styleModule = Facet.define<StyleModule>()
 export const enum UpdateFlag { Focus = 1, Height = 2, Viewport = 4, LineGaps = 8, Geometry = 16 }
 
 export class ChangedRange {
-  constructor(readonly fromA: number, readonly toA: number, readonly fromB: number, readonly toB: number) {}
+  constructor(readonly fromA: number, readonly toA: number, readonly fromB: number, readonly toB: number) { }
 
   join(other: ChangedRange): ChangedRange {
     return new ChangedRange(Math.min(this.fromA, other.fromA), Math.max(this.toA, other.toA),
-                            Math.min(this.fromB, other.fromB), Math.max(this.toB, other.toB))
+      Math.min(this.fromB, other.fromB), Math.max(this.toB, other.toB))
   }
 
   addToSet(set: ChangedRange[]): ChangedRange[] {
@@ -302,7 +302,7 @@ export class ChangedRange {
   static extendWithRanges(diff: readonly ChangedRange[], ranges: number[]): readonly ChangedRange[] {
     if (ranges.length == 0) return diff
     let result: ChangedRange[] = []
-    for (let dI = 0, rI = 0, posA = 0, posB = 0;; dI++) {
+    for (let dI = 0, rI = 0, posA = 0, posB = 0; ; dI++) {
       let next = dI == diff.length ? null : diff[dI], off = posA - posB
       let end = next ? next.fromB : 1e9
       while (rI < ranges.length && ranges[rI] < end) {
@@ -326,12 +326,9 @@ export class ViewUpdate {
   readonly changes: ChangeSet
   /// The previous editor state.
   readonly startState: EditorState
-  /// @internal
   flags = 0
-  /// @internal
   changedRanges: readonly ChangedRange[]
 
-  /// @internal
   constructor(
     /// The editor view that the update is associated with.
     readonly view: EditorView,
@@ -385,6 +382,5 @@ export class ViewUpdate {
     return this.transactions.some(tr => tr.selection)
   }
 
-  /// @internal
   get empty() { return this.flags == 0 && this.transactions.length == 0 }
 }
