@@ -1,6 +1,5 @@
 export {EditorView, DOMEventMap, DOMEventHandlers} from "./editorview"
 export {Command, ViewPlugin, PluginValue, PluginSpec, PluginFieldProvider, PluginField, ViewUpdate, logException} from "./extension"
-export {PluginInstance, viewPlugin, editorAttributes, contentAttributes, decorations, styleModule} from "./extension"
 export {Decoration, DecorationSet, WidgetType, BlockType} from "./decoration"
 export {BlockInfo} from "./heightmap"
 export {MouseSelectionStyle} from "./input"
@@ -20,3 +19,6 @@ import {ChangedRange} from "./extension"
 import {computeOrder, moveVisually} from "./bidi"
 /// @internal
 export const __test = {HeightMap, HeightOracle, MeasuredHeights, QueryType, ChangedRange, computeOrder, moveVisually}
+
+export {PluginInstance, viewPlugin, editorAttributes, contentAttributes, decorations, styleModule} from "./extension"
+export {ViewState, Viewport} from './viewstate'
