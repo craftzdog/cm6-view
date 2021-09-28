@@ -20,5 +20,11 @@ import {computeOrder, moveVisually} from "./bidi"
 /// @internal
 export const __test = {HeightMap, HeightOracle, MeasuredHeights, QueryType, ChangedRange, computeOrder, moveVisually}
 
-export {PluginInstance, viewPlugin, editorAttributes, contentAttributes, decorations, styleModule} from "./extension"
+export {PluginInstance, viewPlugin, editorAttributes, contentAttributes, decorations, styleModule, ChangedRange} from "./extension"
 export {ViewState, Viewport} from './viewstate'
+
+import { addRange } from './decoration'
+const decorationHelpers =  { addRange }
+export { decorationHelpers}
+
+export {theme, darkTheme, buildTheme, baseThemeID, baseLightID, baseDarkID, lightDarkIDs, baseTheme} from "./theme"
