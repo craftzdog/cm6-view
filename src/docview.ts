@@ -1,7 +1,7 @@
 import {RangeSet} from "@codemirror/rangeset"
 import {ChangeSet, SelectionRange} from "@codemirror/state"
 import {ContentView, ChildCursor, Dirty, DOMPos} from "./contentview"
-import {BlockView, LineView} from "./blockview"
+import {BlockView, LineView, BlockWidgetView} from "./blockview"
 import {InlineView, CompositionView} from "./inlineview"
 import {ContentBuilder} from "./buildview"
 import browser from "./browser"
@@ -81,7 +81,7 @@ export class DocView extends ContentView {
 
     let pointerSel = update.transactions.some(tr => tr.isUserEvent("select.pointer"))
     if (this.dirty == Dirty.Not && changedRanges.length == 0 &&
-        !(update.flags & (UpdateFlag.Viewport | UpdateFlag.LineGaps)) &&
+        !(update.flags & UpdateFlag.Viewport) &&
         update.state.selection.main.from >= this.view.viewport.from &&
         update.state.selection.main.to <= this.view.viewport.to) {
       this.updateSelection(forceSelection, pointerSel)
@@ -90,6 +90,14 @@ export class DocView extends ContentView {
       this.updateInner(changedRanges, deco, update.startState.doc.length, forceSelection, pointerSel)
       return true
     }
+  }
+
+  reset(sel: boolean) {
+    if (this.dirty) {
+      this.view.observer.ignore(() => this.view.docView.sync())
+      this.dirty = Dirty.Not
+    }
+    if (sel) this.updateSelection()
   }
 
   // Used both by update and checkLayout do perform the actual DOM
@@ -117,6 +125,10 @@ export class DocView extends ContentView {
       this.updateSelection(forceSelection, pointerSel)
       this.dom.style.height = ""
     })
+    let gaps = []
+    if (this.view.viewport.from || this.view.viewport.to < this.view.state.doc.length) for (let child of this.children)
+      if (child instanceof BlockWidgetView && child.widget instanceof BlockGapWidget) gaps.push(child.dom!)
+    observer.updateGaps(gaps)
   }
 
   private updateChildren(changes: readonly ChangedRange[], deco: readonly DecorationSet[], oldLength: number) {

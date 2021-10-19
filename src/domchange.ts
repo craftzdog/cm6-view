@@ -71,9 +71,9 @@ export function applyDOMChange(view: EditorView, start: number, end: number, typ
          (change.from == sel.from - 1 && change.to == sel.to && change.insert.length == 0 &&
           dispatchKey(view.contentDOM, "Backspace", 8)) ||
          (change.from == sel.from && change.to == sel.to + 1 && change.insert.length == 0 &&
-          dispatchKey(view.contentDOM, "Delete", 46))) ||
-        browser.ios && view.inputState.flushIOSKey(view))
+          dispatchKey(view.contentDOM, "Delete", 46)))) {
       return
+    }
 
     let text = change.insert.toString()
     if (view.state.facet(inputHandler).some(h => h(view, change!.from, change!.to, text)))
