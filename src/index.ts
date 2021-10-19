@@ -28,3 +28,4 @@ const decorationHelpers =  { addRange }
 export { decorationHelpers}
 
 export {theme, darkTheme, buildTheme, baseThemeID, baseLightID, baseDarkID, lightDarkIDs, baseTheme} from "./theme"
+export {ChildCursor} from './contentview'
