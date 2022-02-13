@@ -1,5 +1,5 @@
 import {tempView} from "@codemirror/buildhelper/lib/tempview"
-import {EditorSelection} from "@codemirror/state"
+import {EditorSelection, Prec} from "@codemirror/state"
 import {EditorView, ViewPlugin} from "@codemirror/view"
 import ist from "ist"
 
@@ -120,19 +120,19 @@ describe("EditorView drawing", () => {
     let cm = tempView("\n".repeat(500), [scroll(150)])
     cm.scrollDOM.scrollTop = 0
     cm.measure()
-    cm.dispatch({effects: EditorView.scrollTo.of(EditorSelection.cursor(250))})
+    cm.dispatch({effects: EditorView.scrollIntoView(250)})
     let box = cm.scrollDOM.getBoundingClientRect(), pos = cm.coordsAtPos(250)
     ist(box.top, pos?.top, "<=")
     ist(box.bottom, pos?.bottom, ">=")
-    cm.dispatch({effects: EditorView.scrollTo.of(EditorSelection.range(403, 400))})
+    cm.dispatch({effects: EditorView.scrollIntoView(EditorSelection.range(403, 400))})
     let top = cm.coordsAtPos(400), bot = cm.coordsAtPos(403)
     ist(box.top, top?.top, "<=")
     ist(box.bottom, bot?.bottom, ">=")
-    cm.dispatch({effects: EditorView.scrollTo.of(EditorSelection.range(300, 400))})
+    cm.dispatch({effects: EditorView.scrollIntoView(EditorSelection.range(300, 400))})
     let pos400 = cm.coordsAtPos(400)
     ist(box.top, pos400?.top, "<=")
     ist(box.bottom, pos400?.bottom, ">=")
-    cm.dispatch({effects: EditorView.scrollTo.of(EditorSelection.range(150, 100))})
+    cm.dispatch({effects: EditorView.scrollIntoView(EditorSelection.range(150, 100))})
     let pos100 = cm.coordsAtPos(100)
     ist(box.top, pos100?.top, "<=")
     ist(box.bottom, pos100?.bottom, ">=")
@@ -157,7 +157,13 @@ describe("EditorView drawing", () => {
       changes.push({from, to, insert: "XYZ"})
     }
     cm.dispatch({changes})
-    ist(domText(cm), cm.state.doc.slice(cm.viewport.from, cm.viewport.to))
+    ist(domText(cm), cm.state.sliceDoc(cm.viewport.from, cm.viewport.to))
+  })
+
+  it("can replace across line boundaries", () => {
+    let cm = tempView("ab\ncd\nef")
+    cm.dispatch({changes: {from: 1, to: 4, insert: "XYZ"}})
+    ist(domText(cm), cm.state.doc.toString())
   })
 
   it("can handle deleting a line's content", () => {
@@ -266,5 +272,14 @@ describe("EditorView drawing", () => {
     editor.measure()
     ist(getComputedStyle(editor.dom).display, "flex")
     wrap.remove()
+  })
+
+  it("allows editor attributes to override each other", () => {
+    let cm = tempView("", [
+      EditorView.contentAttributes.of({"data-x": "x"}),
+      EditorView.contentAttributes.of({"data-x": "y"}),
+      Prec.highest(EditorView.contentAttributes.of({"data-x": "z"})),
+    ])
+    ist(cm.contentDOM.getAttribute("data-x"), "z")
   })
 })

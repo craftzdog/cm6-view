@@ -1,29 +1,33 @@
 import {RangeSet} from "@codemirror/rangeset"
-import {ChangeSet, SelectionRange} from "@codemirror/state"
-import {ContentView, ChildCursor, Dirty, DOMPos} from "./contentview"
+import {ChangeSet} from "@codemirror/state"
+import {ContentView, ChildCursor, Dirty, DOMPos, replaceRange} from "./contentview"
 import {BlockView, LineView, BlockWidgetView} from "./blockview"
-import {InlineView, CompositionView} from "./inlineview"
+import {CompositionView} from "./inlineview"
 import {ContentBuilder} from "./buildview"
 import browser from "./browser"
 import {Decoration, DecorationSet, WidgetType, BlockType, addRange} from "./decoration"
-import {clientRectsFor, isEquivalentPosition, maxOffset, Rect, scrollRectIntoView, getSelection, hasSelection} from "./dom"
+import {clientRectsFor, isEquivalentPosition, maxOffset, Rect, scrollRectIntoView,
+        getSelection, hasSelection} from "./dom"
 import {ViewUpdate, PluginField, decorations as decorationsFacet,
-        UpdateFlag, editable, ChangedRange} from "./extension"
+        editable, ChangedRange, ScrollTarget} from "./extension"
 import {EditorView} from "./editorview"
+import {Direction} from "./bidi"
+import {DOMReader, LineBreakPlaceholder} from "./domreader"
 
 export class DocView extends ContentView {
   children!: BlockView[]
 
   compositionDeco = Decoration.none
   decorations: readonly DecorationSet[] = []
+  pluginDecorationLength = 0
 
   // Track a minimum width for the editor. When measuring sizes in
-  // checkLayout, this is updated to point at the width of a given
-  // element and its extent in the document. When a change happens in
-  // that range, these are reset. That way, once we've seen a
-  // line/element of a given length, we keep the editor wide enough to
-  // fit at least that element, until it is changed, at which point we
-  // forget it again.
+  // measureVisibleLineHeights, this is updated to point at the width
+  // of a given element and its extent in the document. When a change
+  // happens in that range, these are reset. That way, once we've seen
+  // a line/element of a given length, we keep the editor wide enough
+  // to fit at least that element, until it is changed, at which point
+  // we forget it again.
   minWidth = 0
   minWidthFrom = 0
   minWidthTo = 0
@@ -32,8 +36,13 @@ export class DocView extends ContentView {
   // we don't mess it up when reading it back it
   impreciseAnchor: DOMPos | null = null
   impreciseHead: DOMPos | null = null
+  forceSelection = false
 
   dom!: HTMLElement
+
+  // Used by the resize observer to ignore resizes that we caused
+  // ourselves
+  lastUpdate = Date.now()
 
   get root() { return this.view.root }
 
@@ -46,7 +55,8 @@ export class DocView extends ContentView {
     this.setDOM(view.contentDOM)
     this.children = [new LineView]
     this.children[0].setParent(this)
-    this.updateInner([new ChangedRange(0, 0, 0, view.state.doc.length)], this.updateDeco(), 0)
+    this.updateDeco()
+    this.updateInner([new ChangedRange(0, 0, 0, view.state.doc.length)], 0)
   }
 
   // Update the document view to a given state. scrollIntoView can be
@@ -57,54 +67,45 @@ export class DocView extends ContentView {
     let changedRanges = update.changedRanges
     if (this.minWidth > 0 && changedRanges.length) {
       if (!changedRanges.every(({fromA, toA}) => toA < this.minWidthFrom || fromA > this.minWidthTo)) {
-        this.minWidth = 0
+        this.minWidth = this.minWidthFrom = this.minWidthTo = 0
       } else {
         this.minWidthFrom = update.changes.mapPos(this.minWidthFrom, 1)
         this.minWidthTo = update.changes.mapPos(this.minWidthTo, 1)
       }
     }
 
-    if (this.view.inputState.composing < 0) this.compositionDeco = Decoration.none
-    else if (update.transactions.length) this.compositionDeco = computeCompositionDeco(this.view, update.changes)
+    if (this.view.inputState.composing < 0)
+      this.compositionDeco = Decoration.none
+    else if (update.transactions.length || this.dirty)
+      this.compositionDeco = computeCompositionDeco(this.view, update.changes)
 
     // When the DOM nodes around the selection are moved to another
     // parent, Chrome sometimes reports a different selection through
     // getSelection than the one that it actually shows to the user.
     // This forces a selection update when lines are joined to work
     // around that. Issue #54
-    let forceSelection = (browser.ie || browser.chrome) && !this.compositionDeco.size && update &&
-      update.state.doc.lines != update.startState.doc.lines
+    if ((browser.ie || browser.chrome) && !this.compositionDeco.size && update &&
+        update.state.doc.lines != update.startState.doc.lines)
+      this.forceSelection = true
 
     let prevDeco = this.decorations, deco = this.updateDeco()
     let decoDiff = findChangedDeco(prevDeco, deco, update.changes)
     changedRanges = ChangedRange.extendWithRanges(changedRanges, decoDiff)
 
-    let pointerSel = update.transactions.some(tr => tr.isUserEvent("select.pointer"))
-    if (this.dirty == Dirty.Not && changedRanges.length == 0 &&
-        !(update.flags & UpdateFlag.Viewport) &&
-        update.state.selection.main.from >= this.view.viewport.from &&
-        update.state.selection.main.to <= this.view.viewport.to) {
-      this.updateSelection(forceSelection, pointerSel)
+    if (this.dirty == Dirty.Not && changedRanges.length == 0) {
       return false
     } else {
-      this.updateInner(changedRanges, deco, update.startState.doc.length, forceSelection, pointerSel)
+      this.updateInner(changedRanges, update.startState.doc.length)
+      if (update.transactions.length) this.lastUpdate = Date.now()
       return true
     }
   }
 
-  reset(sel: boolean) {
-    if (this.dirty) {
-      this.view.observer.ignore(() => this.view.docView.sync())
-      this.dirty = Dirty.Not
-    }
-    if (sel) this.updateSelection()
-  }
-
-  // Used both by update and checkLayout do perform the actual DOM
+  // Used by update and the constructor do perform the actual DOM
   // update
-  private updateInner(changes: readonly ChangedRange[], deco: readonly DecorationSet[],
-                      oldLength: number, forceSelection = false, pointerSel = false) {
-    this.updateChildren(changes, deco, oldLength)
+  private updateInner(changes: readonly ChangedRange[], oldLength: number) {
+    this.view.viewState.mustMeasureContent = true
+    this.updateChildren(changes, oldLength)
 
     let {observer} = this.view
     observer.ignore(() => {
@@ -112,7 +113,7 @@ export class DocView extends ContentView {
       // messes with the scroll position during DOM mutation (though
       // no relayout is triggered and I cannot imagine how it can
       // recompute the scroll position without a layout)
-      this.dom.style.height = this.view.viewState.domHeight + "px"
+      this.dom.style.height = this.view.viewState.contentHeight + "px"
       this.dom.style.minWidth = this.minWidth ? this.minWidth + "px" : ""
       // Chrome will sometimes, when DOM mutations occur directly
       // around the selection, get confused and report a different
@@ -121,8 +122,7 @@ export class DocView extends ContentView {
       let track = browser.chrome || browser.ios ? {node: observer.selectionRange.focusNode!, written: false} : undefined
       this.sync(track)
       this.dirty = Dirty.Not
-      if (track && (track.written || observer.selectionRange.focusNode != track.node)) forceSelection = true
-      this.updateSelection(forceSelection, pointerSel)
+      if (track && (track.written || observer.selectionRange.focusNode != track.node)) this.forceSelection = true
       this.dom.style.height = ""
     })
     let gaps = []
@@ -131,83 +131,27 @@ export class DocView extends ContentView {
     observer.updateGaps(gaps)
   }
 
-  private updateChildren(changes: readonly ChangedRange[], deco: readonly DecorationSet[], oldLength: number) {
+  private updateChildren(changes: readonly ChangedRange[], oldLength: number) {
     let cursor = this.childCursor(oldLength)
     for (let i = changes.length - 1;; i--) {
       let next = i >= 0 ? changes[i] : null
       if (!next) break
       let {fromA, toA, fromB, toB} = next
-      let {content, breakAtStart, openStart, openEnd} = ContentBuilder.build(this.view.state.doc, fromB, toB, deco)
+      let {content, breakAtStart, openStart, openEnd} = ContentBuilder.build(this.view.state.doc, fromB, toB,
+                                                                             this.decorations, this.pluginDecorationLength)
       let {i: toI, off: toOff} = cursor.findPos(toA, 1)
       let {i: fromI, off: fromOff} = cursor.findPos(fromA, -1)
-      this.replaceRange(fromI, fromOff, toI, toOff, content, breakAtStart, openStart, openEnd)
+      replaceRange(this, fromI, fromOff, toI, toOff, content, breakAtStart, openStart, openEnd)
     }
-  }
-
-  private replaceRange(fromI: number, fromOff: number, toI: number, toOff: number,
-                       content: BlockView[], breakAtStart: number, openStart: number, openEnd: number) {
-    let before = this.children[fromI], last = content.length ? content[content.length - 1] : null
-    let breakAtEnd = last ? last.breakAfter : breakAtStart
-    // Change within a single line
-    if (fromI == toI && !breakAtStart && !breakAtEnd && content.length < 2 &&
-        before.merge(fromOff, toOff, content.length ? last : null, fromOff == 0, openStart, openEnd))
-      return
-
-    let after = this.children[toI]
-    // Make sure the end of the line after the update is preserved in `after`
-    if (toOff < after.length) {
-      // If we're splitting a line, separate part of the start line to
-      // avoid that being mangled when updating the start line.
-      if (fromI == toI) {
-        after = after.split(toOff)
-        toOff = 0
-      }
-      // If the element after the replacement should be merged with
-      // the last replacing element, update `content`
-      if (!breakAtEnd && last && after.merge(0, toOff, last, true, 0, openEnd)) {
-        content[content.length - 1] = after
-      } else {
-        // Remove the start of the after element, if necessary, and
-        // add it to `content`.
-        if (toOff) after.merge(0, toOff, null, false, 0, openEnd)
-        content.push(after)
-      }
-    } else if (after.breakAfter) {
-      // The element at `toI` is entirely covered by this range.
-      // Preserve its line break, if any.
-      if (last) last.breakAfter = 1
-      else breakAtStart = 1
-    }
-    // Since we've handled the next element from the current elements
-    // now, make sure `toI` points after that.
-    toI++
-
-    before.breakAfter = breakAtStart
-    if (fromOff > 0) {
-      if (!breakAtStart && content.length && before.merge(fromOff, before.length, content[0], false, openStart, 0)) {
-        before.breakAfter = content.shift()!.breakAfter
-      } else if (fromOff < before.length || before.children.length && before.children[before.children.length - 1].length == 0) {
-        before.merge(fromOff, before.length, null, false, openStart, 0)
-      }
-      fromI++
-    }
-
-    // Try to merge widgets on the boundaries of the replacement
-    while (fromI < toI && content.length) {
-      if (this.children[toI - 1].match(content[content.length - 1]))
-        toI--, content.pop()
-      else if (this.children[fromI].match(content[0]))
-        fromI++, content.shift()
-      else
-        break
-    }
-    if (fromI < toI || content.length) this.replaceChildren(fromI, toI, content)
   }
 
   // Sync the DOM selection to this.state.selection
-  updateSelection(force = false, fromPointer = false) {
+  updateSelection(mustRead = false, fromPointer = false) {
+    if (mustRead) this.view.observer.readSelectionRange()
     if (!(fromPointer || this.mayControlSelection()) ||
         browser.ios && this.view.inputState.rapidCompositionStart) return
+    let force = this.forceSelection
+    this.forceSelection = false
 
     let main = this.view.state.selection.main
     // FIXME need to handle the case where the selection falls inside a block range
@@ -229,6 +173,15 @@ export class DocView extends ContentView {
         !isEquivalentPosition(anchor.node, anchor.offset, domSel.anchorNode, domSel.anchorOffset) ||
         !isEquivalentPosition(head.node, head.offset, domSel.focusNode, domSel.focusOffset)) {
       this.view.observer.ignore(() => {
+        // Chrome Android will hide the virtual keyboard when tapping
+        // inside an uneditable node, and not bring it back when we
+        // move the cursor to its proper position. This tries to
+        // restore the keyboard by cycling focus.
+        if (browser.android && browser.chrome && this.dom.contains(domSel.focusNode) &&
+            inUneditable(domSel.focusNode, this.dom)) {
+          this.dom.blur()
+          this.dom.focus({preventScroll: true})
+        }
         let rawSel = getSelection(this.root)
         if (main.empty) {
           // Work around https://bugzilla.mozilla.org/show_bug.cgi?id=1612076
@@ -266,7 +219,7 @@ export class DocView extends ContentView {
   }
 
   enforceCursorAssoc() {
-    if (this.view.composing) return
+    if (this.compositionDeco.size) return
     let cursor = this.view.state.selection.main
     let sel = getSelection(this.root)
     if (!cursor.empty || !cursor.assoc || !sel.modify) return
@@ -325,17 +278,29 @@ export class DocView extends ContentView {
 
   measureVisibleLineHeights() {
     let result = [], {from, to} = this.view.viewState.viewport
-    let minWidth = Math.max(this.view.scrollDOM.clientWidth, this.minWidth) + 1
+    let contentWidth = this.view.contentDOM.clientWidth
+    let isWider = contentWidth > Math.max(this.view.scrollDOM.clientWidth, this.minWidth) + 1
+    let widest = -1
     for (let pos = 0, i = 0; i < this.children.length; i++) {
       let child = this.children[i], end = pos + child.length
       if (end > to) break
       if (pos >= from) {
-        result.push(child.dom!.getBoundingClientRect().height)
-        let width = child.dom!.scrollWidth
-        if (width > minWidth) {
-          this.minWidth = minWidth = width
-          this.minWidthFrom = pos
-          this.minWidthTo = end
+        let childRect = child.dom!.getBoundingClientRect()
+        result.push(childRect.height)
+        if (isWider) {
+          let last = child.dom!.lastChild
+          let rects = last ? clientRectsFor(last) : []
+          if (rects.length) {
+            let rect = rects[rects.length - 1]
+            let width = this.view.textDirection == Direction.LTR ? rect.right - childRect.left
+              : childRect.right - rect.left
+            if (width > widest) {
+              widest = width
+              this.minWidth = contentWidth
+              this.minWidthFrom = pos
+              this.minWidthTo = end
+            }
+          }
         }
       }
       pos = end + child.breakAfter
@@ -379,7 +344,7 @@ export class DocView extends ContentView {
       let next = i == vs.viewports.length ? null : vs.viewports[i]
       let end = next ? next.from - 1 : this.length
       if (end > pos) {
-        let height = vs.lineAt(end, 0).bottom - vs.lineAt(pos, 0).top
+        let height = vs.lineBlockAt(end).bottom - vs.lineBlockAt(pos).top
         deco.push(Decoration.replace({widget: new BlockGapWidget(height), block: true, inclusive: true}).range(pos, end))
       }
       if (!next) break
@@ -389,8 +354,10 @@ export class DocView extends ContentView {
   }
 
   updateDeco() {
+    let pluginDecorations = this.view.pluginField(PluginField.decorations)
+    this.pluginDecorationLength = pluginDecorations.length
     return this.decorations = [
-      ...this.view.pluginField(PluginField.decorations),
+      ...pluginDecorations,
       ...this.view.state.facet(decorationsFacet),
       this.compositionDeco,
       this.computeBlockGapDeco(),
@@ -398,7 +365,8 @@ export class DocView extends ContentView {
     ]
   }
 
-  scrollRangeIntoView(range: SelectionRange) {
+  scrollIntoView(target: ScrollTarget) {
+    let {range} = target
     let rect = this.coordsAt(range.head, range.empty ? range.assoc : range.head > range.anchor ? -1 : 1), other
     if (!rect) return
     if (!range.empty && (other = this.coordsAt(range.anchor, range.anchor > range.head ? -1 : 1)))
@@ -413,11 +381,17 @@ export class DocView extends ContentView {
       if (top != null) mTop = Math.max(mTop, top)
       if (bottom != null) mBottom = Math.max(mBottom, bottom)
     }
-    scrollRectIntoView(this.dom, {
+    let targetRect = {
       left: rect.left - mLeft, top: rect.top - mTop,
       right: rect.right + mRight, bottom: rect.bottom + mBottom
-    }, range.head < range.anchor ? -1 : 1)
+    }
+    scrollRectIntoView(this.view.scrollDOM, targetRect, range.head < range.anchor ? -1 : 1,
+                       target.x, target.y, target.xMargin, target.yMargin,
+                       this.view.textDirection == Direction.LTR)
   }
+
+  // Will never be called but needs to be present
+  split!: () => ContentView
 }
 
 function betweenUneditable(pos: DOMPos) {
@@ -445,37 +419,52 @@ class BlockGapWidget extends WidgetType {
   get estimatedHeight() { return this.height }
 }
 
-export function computeCompositionDeco(view: EditorView, changes: ChangeSet): DecorationSet {
+export function compositionSurroundingNode(view: EditorView) {
   let sel = view.observer.selectionRange
   let textNode = sel.focusNode && nearbyTextNode(sel.focusNode, sel.focusOffset, 0)
-  if (!textNode) return Decoration.none
+  if (!textNode) return null
   let cView = view.docView.nearest(textNode)
-  let from: number, to: number, topNode: Node = textNode
-  if (cView instanceof InlineView) {
-    while (cView.parent instanceof InlineView) cView = cView.parent
-    from = cView.posAtStart
-    to = from + cView.length
-    topNode = cView.dom!
-  } else if (cView instanceof LineView) {
+  if (!cView) return null
+  if (cView instanceof LineView) {
+    let topNode: Node = textNode
     while (topNode.parentNode != cView.dom) topNode = topNode.parentNode!
     let prev = topNode.previousSibling
     while (prev && !ContentView.get(prev)) prev = prev.previousSibling
-    from = to = prev ? ContentView.get(prev)!.posAtEnd : cView.posAtStart
+    let pos = prev ? ContentView.get(prev)!.posAtEnd : cView.posAtStart
+    return {from: pos, to: pos, node: topNode, text: textNode}
   } else {
-    return Decoration.none
+    for (;;) {
+      let {parent} = cView
+      if (!parent) return null
+      if (parent instanceof LineView) break
+      cView = parent as ContentView
+    }
+    let from = cView.posAtStart
+    return {from, to: from + cView.length, node: cView.dom!, text: textNode}
   }
+}
+
+function computeCompositionDeco(view: EditorView, changes: ChangeSet): DecorationSet {
+  let surrounding = compositionSurroundingNode(view)
+  if (!surrounding) return Decoration.none
+  let {from, to, node, text: textNode} = surrounding
 
   let newFrom = changes.mapPos(from, 1), newTo = Math.max(newFrom, changes.mapPos(to, -1))
-  let text = textNode.nodeValue!, {state} = view
+  let {state} = view, text = node.nodeType == 3 ? node.nodeValue! :
+    new DOMReader([], state).readRange(node.firstChild, null).text
+
   if (newTo - newFrom < text.length) {
-    if (state.sliceDoc(newFrom, Math.min(state.doc.length, newFrom + text.length)) == text) newTo = newFrom + text.length
-    else if (state.sliceDoc(Math.max(0, newTo - text.length), newTo) == text) newFrom = newTo - text.length
-    else return Decoration.none
-  } else if (state.sliceDoc(newFrom, newTo) != text) {
+    if (state.doc.sliceString(newFrom, Math.min(state.doc.length, newFrom + text.length), LineBreakPlaceholder) == text)
+      newTo = newFrom + text.length
+    else if (state.doc.sliceString(Math.max(0, newTo - text.length), newTo, LineBreakPlaceholder) == text)
+      newFrom = newTo - text.length
+    else
+      return Decoration.none
+  } else if (state.doc.sliceString(newFrom, newTo, LineBreakPlaceholder) != text) {
     return Decoration.none
   }
 
-  return Decoration.set(Decoration.replace({widget: new CompositionWidget(topNode, textNode)}).range(newFrom, newTo))
+  return Decoration.set(Decoration.replace({widget: new CompositionWidget(node, textNode)}).range(newFrom, newTo))
 }
 
 export class CompositionWidget extends WidgetType {
@@ -523,4 +512,13 @@ function findChangedDeco(a: readonly DecorationSet[], b: readonly DecorationSet[
   let comp = new DecorationComparator
   RangeSet.compare(a, b, diff, comp)
   return comp.changes
+}
+
+function inUneditable(node: Node | null, inside: HTMLElement) {
+  for (let cur = node; cur && cur != inside; cur = (cur as HTMLElement).assignedSlot || cur.parentNode) {
+    if (cur.nodeType == 1 && (cur as HTMLElement).contentEditable == 'false') {
+      return true;
+    }
+  }
+  return false;
 }

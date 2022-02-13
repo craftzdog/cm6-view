@@ -21,7 +21,7 @@ export class DOMPos {
   static after(dom: Node, precise?: boolean) { return new DOMPos(dom.parentNode!, domIndex(dom) + 1, precise) }
 }
 
-const none: any[] = []
+export const noChildren: ContentView[] = []
 
 export abstract class ContentView {
   parent: ContentView | null = null
@@ -66,21 +66,28 @@ export abstract class ContentView {
 
   sync(track?: {node: Node, written: boolean}) {
     if (this.dirty & Dirty.Node) {
-      let parent = this.dom as HTMLElement, pos: Node | null = null
+      let parent = this.dom as HTMLElement
+      let pos: Node | null = parent.firstChild
       for (let child of this.children) {
         if (child.dirty) {
-          let next = pos ? pos.nextSibling : parent.firstChild
-          if (!child.dom && next && !ContentView.get(next)?.parent) child.reuseDOM(next)
+          if (!child.dom && pos) {
+            let contentView = ContentView.get(pos)
+            if (!contentView || !contentView.parent && contentView.constructor == child.constructor)
+              child.reuseDOM(pos)
+          }
           child.sync(track)
           child.dirty = Dirty.Not
         }
-        if (track && track.node == parent && pos != child.dom) track.written = true
-        syncNodeInto(parent, pos, child.dom!)
-        pos = child.dom!
+        if (track && !track.written && track.node == parent && pos != child.dom) track.written = true
+        if (child.dom!.parentNode == parent) {
+          while (pos && pos != child.dom) pos = rm(pos)
+          pos = child.dom!.nextSibling
+        } else {
+          parent.insertBefore(child.dom!, pos)
+        }
       }
-      let next: Node | null = pos ? pos.nextSibling : parent.firstChild
-      if (next && track && track.node == parent) track.written = true
-      while (next) next = rm(next)
+      if (pos && track && track.node == parent) track.written = true
+      while (pos) pos = rm(pos)
     } else if (this.dirty & Dirty.Child) {
       for (let child of this.children) if (child.dirty) {
         child.sync(track)
@@ -89,7 +96,7 @@ export abstract class ContentView {
     }
   }
 
-  reuseDOM(_dom: Node) { return false }
+  reuseDOM(_dom: Node) {}
 
   abstract domAtPos(pos: number): DOMPos
 
@@ -185,11 +192,11 @@ export abstract class ContentView {
     }
   }
 
-  replaceChildren(from: number, to: number, children: ContentView[] = none) {
+  replaceChildren(from: number, to: number, children: ContentView[] = noChildren) {
     this.markDirty()
     for (let i = from; i < to; i++) {
       let child = this.children[i]
-      if (child.parent == this) child.parent = null
+      if (child.parent == this) child.destroy()
     }
     this.children.splice(from, to - from, ...children)
     for (let i = 0; i < children.length; i++) children[i].setParent(this)
@@ -216,21 +223,32 @@ export abstract class ContentView {
   static get(node: Node): ContentView | null { return (node as any).cmView }
 
   get isEditable() { return true }
+
+  merge(from: number, to: number, source: ContentView | null, hasStart: boolean, openStart: number, openEnd: number): boolean {
+    return false
+  }
+
+  become(other: ContentView): boolean { return false }
+
+  abstract split(at: number): ContentView
+
+  // When this is a zero-length view with a side, this should return a
+  // number <= 0 to indicate it is before its position, or a
+  // number > 0 when after its position.
+  getSide() { return 0 }
+
+  destroy() {
+    this.parent = null
+  }
 }
 
 ContentView.prototype.breakAfter = 0
 
 // Remove a DOM node and return its next sibling.
-function rm(dom: Node): Node {
+function rm(dom: Node): Node | null {
   let next = dom.nextSibling
   dom.parentNode!.removeChild(dom)
-  return next!
-}
-
-function syncNodeInto(parent: HTMLElement, after: Node | null, dom: Node) {
-  let next: Node | null = after ? after.nextSibling : parent.firstChild
-  if (dom.parentNode == parent) while (next != dom) next = rm(next!)
-  else parent.insertBefore(dom, next)
+  return next
 }
 
 export class ChildCursor {
@@ -249,4 +267,91 @@ export class ChildCursor {
       this.pos -= next.length + next.breakAfter
     }
   }
+}
+
+export function replaceRange(parent: ContentView, fromI: number, fromOff: number, toI: number, toOff: number,
+                             insert: ContentView[], breakAtStart: number, openStart: number, openEnd: number) {
+  let {children} = parent
+  let before = children.length ? children[fromI] : null
+  let last = insert.length ? insert[insert.length - 1] : null
+  let breakAtEnd = last ? last.breakAfter : breakAtStart
+  // Change within a single child
+  if (fromI == toI && before && !breakAtStart && !breakAtEnd && insert.length < 2 &&
+      before.merge(fromOff, toOff, insert.length ? last : null, fromOff == 0, openStart, openEnd))
+    return
+
+  if (toI < children.length) {
+    let after = children[toI]
+    // Make sure the end of the child after the update is preserved in `after`
+    if (after && toOff < after.length) {
+      // If we're splitting a child, separate part of it to avoid that
+      // being mangled when updating the child before the update.
+      if (fromI == toI) {
+        after = after.split(toOff)
+        toOff = 0
+      }
+      // If the element after the replacement should be merged with
+      // the last replacing element, update `content`
+      if (!breakAtEnd && last && after.merge(0, toOff, last, true, 0, openEnd)) {
+        insert[insert.length - 1] = after
+      } else {
+        // Remove the start of the after element, if necessary, and
+        // add it to `content`.
+        if (toOff) after.merge(0, toOff, null, false, 0, openEnd)
+        insert.push(after)
+      }
+    } else if (after?.breakAfter) {
+      // The element at `toI` is entirely covered by this range.
+      // Preserve its line break, if any.
+      if (last) last.breakAfter = 1
+      else breakAtStart = 1
+    }
+    // Since we've handled the next element from the current elements
+    // now, make sure `toI` points after that.
+    toI++
+  }
+
+  if (before) {
+    before.breakAfter = breakAtStart
+    if (fromOff > 0) {
+      if (!breakAtStart && insert.length && before.merge(fromOff, before.length, insert[0], false, openStart, 0)) {
+        before.breakAfter = insert.shift()!.breakAfter
+      } else if (fromOff < before.length || before.children.length && before.children[before.children.length - 1].length == 0) {
+        before.merge(fromOff, before.length, null, false, openStart, 0)
+      }
+      fromI++
+    }
+  }
+
+  // Try to merge widgets on the boundaries of the replacement
+  while (fromI < toI && insert.length) {
+    if (children[toI - 1].become(insert[insert.length - 1])) {
+      toI--
+      insert.pop()
+      openEnd = insert.length ? 0 : openStart
+    } else if (children[fromI].become(insert[0])) {
+      fromI++
+      insert.shift()
+      openStart = insert.length ? 0 : openEnd
+    } else {
+      break
+    }
+  }
+  if (!insert.length && fromI && toI < children.length && !children[fromI - 1].breakAfter &&
+      children[toI].merge(0, 0, children[fromI - 1], false, openStart, openEnd))
+    fromI--
+
+  if (fromI < toI || insert.length) parent.replaceChildren(fromI, toI, insert)
+}
+
+export function mergeChildrenInto(parent: ContentView, from: number, to: number,
+                                  insert: ContentView[], openStart: number, openEnd: number) {
+  let cur = parent.childCursor()
+  let {i: toI, off: toOff} = cur.findPos(to, 1)
+  let {i: fromI, off: fromOff} = cur.findPos(from, -1)
+  let dLen = from - to
+  for (let view of insert) dLen += view.length
+  parent.length += dLen
+
+  replaceRange(parent, fromI, fromOff, toI, toOff, insert, 0, openStart, openEnd)
 }

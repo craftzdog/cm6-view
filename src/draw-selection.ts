@@ -8,6 +8,10 @@ import browser from "./browser"
 
 const CanHidePrimary = !browser.ios // FIXME test IE
 
+// Added to selection rectangles vertical extent to prevent rounding
+// errors from introducing gaps in the rendered content.
+const enum C { Epsilon = 0.01 }
+
 type SelectionConfig = {
   /// The length of a full cursor blink cycle, in milliseconds.
   /// Defaults to 1200. Can be set to 0 to disable blinking.
@@ -158,9 +162,7 @@ const themeSpec = {
   }
 }
 if (CanHidePrimary) (themeSpec as any)[".cm-line"].caretColor = "transparent !important"
-const hideNativeSelection = Prec.override(EditorView.theme(themeSpec))
-
-
+const hideNativeSelection = Prec.highest(EditorView.theme(themeSpec))
 
 function getBase(view: EditorView) {
   let rect = view.scrollDOM.getBoundingClientRect()
@@ -176,7 +178,7 @@ function wrappedLine(view: EditorView, pos: number, inside: {from: number, to: n
 }
 
 function blockAt(view: EditorView, pos: number): BlockInfo {
-  let line = view.visualLineAt(pos)
+  let line = view.lineBlockAt(pos)
   if (Array.isArray(line.type)) for (let l of line.type) {
     if (l.to > pos || l.to == pos && (l.to == line.to || l.type == BlockType.Text)) return l
   }
@@ -190,7 +192,7 @@ function measureRange(view: EditorView, range: SelectionRange): Piece[] {
   let ltr = view.textDirection == Direction.LTR
   let content = view.contentDOM, contentRect = content.getBoundingClientRect(), base = getBase(view)
   let lineStyle = window.getComputedStyle(content.firstChild as HTMLElement)
-  let leftSide = contentRect.left + parseInt(lineStyle.paddingLeft)
+  let leftSide = contentRect.left + parseInt(lineStyle.paddingLeft) + Math.min(0, parseInt(lineStyle.textIndent))
   let rightSide = contentRect.right - parseInt(lineStyle.paddingRight)
 
   let startBlock = blockAt(view, from), endBlock = blockAt(view, to)
@@ -208,13 +210,14 @@ function measureRange(view: EditorView, range: SelectionRange): Piece[] {
     let between = []
     if ((visualStart || startBlock).to < (visualEnd || endBlock).from - 1)
       between.push(piece(leftSide, top.bottom, rightSide, bottom.top))
-    else if (top.bottom < bottom.top && blockAt(view, (top.bottom + bottom.top) / 2).type == BlockType.Text)
+    else if (top.bottom < bottom.top && view.elementAtHeight((top.bottom + bottom.top) / 2).type == BlockType.Text)
       top.bottom = bottom.top = (top.bottom + bottom.top) / 2
     return pieces(top).concat(between).concat(pieces(bottom))
   }
 
   function piece(left: number, top: number, right: number, bottom: number) {
-    return new Piece(left - base.left, top - base.top, right - left, bottom - top, "cm-selectionBackground")
+    return new Piece(left - base.left, top - base.top - C.Epsilon, right - left, bottom - top + C.Epsilon,
+                     "cm-selectionBackground")
   }
   function pieces({top, bottom, horizontal}: {top: number, bottom: number, horizontal: number[]}) {
     let pieces = []

@@ -123,35 +123,52 @@ function domPosInText(node: Text, x: number, y: number): {node: Node, offset: nu
 }
 
 export function posAtCoords(view: EditorView, {x, y}: {x: number, y: number}, precise: boolean, bias: -1 | 1 = -1): number | null {
-  let content = view.contentDOM.getBoundingClientRect(), block
-  let halfLine = view.defaultLineHeight / 2
-  for (let bounced = false;;) {
-    block = view.blockAtHeight(y, content.top)
-    if (block.top > y || block.bottom < y) {
-      bias = block.top > y ? -1 : 1
-      y = Math.min(block.bottom - halfLine, Math.max(block.top + halfLine, y))
-      if (bounced) return precise ? null : 0
-      else bounced = true
-    }
+  let content = view.contentDOM.getBoundingClientRect(), docTop = content.top + view.viewState.paddingTop
+  let block, {docHeight} = view.viewState
+  let yOffset = y - docTop
+  if (yOffset < 0) return 0
+  if (yOffset > docHeight) return view.state.doc.length
+
+  // Scan for a text block near the queried y position
+  for (let halfLine = view.defaultLineHeight / 2, bounced = false;;) {
+    block = view.elementAtHeight(yOffset)
     if (block.type == BlockType.Text) break
-    y = bias > 0 ? block.bottom + halfLine : block.top - halfLine
+    for (;;) {
+      // Move the y position out of this block
+      yOffset = bias > 0 ? block.bottom + halfLine : block.top - halfLine
+      if (yOffset >= 0 && yOffset <= docHeight) break
+      // If the document consists entirely of replaced widgets, we
+      // won't find a text block, so return 0
+      if (bounced) return precise ? null : 0
+      bounced = true
+      bias = -bias as -1 | 1
+    }
   }
+  y = docTop + yOffset
   let lineStart = block.from
-  // Clip x to the viewport sides
-  x = Math.max(content.left + 1, Math.min(content.right - 1, x))
   // If this is outside of the rendered viewport, we can't determine a position
   if (lineStart < view.viewport.from)
-    return view.viewport.from == 0 ? 0 : posAtCoordsImprecise(view, content, block, x, y)
+    return view.viewport.from == 0 ? 0 : precise ? null : posAtCoordsImprecise(view, content, block, x, y)
   if (lineStart > view.viewport.to)
-    return view.viewport.to == view.state.doc.length ? view.state.doc.length : posAtCoordsImprecise(view, content, block, x, y)
+    return view.viewport.to == view.state.doc.length ? view.state.doc.length :
+      precise ? null : posAtCoordsImprecise(view, content, block, x, y)
   // Prefer ShadowRootOrDocument.elementFromPoint if present, fall back to document if not
   let doc = view.dom.ownerDocument
-  let element = ((view.root as any).elementFromPoint ? view.root as Document : doc).elementFromPoint(x, y)
+  let root = (view.root as any).elementFromPoint ? view.root as Document : doc
+  let element = root.elementFromPoint(x, y)
+  if (element && !view.contentDOM.contains(element)) element = null
+
+  // If the element is unexpected, clip x at the sides of the content area and try again
+  if (!element) {
+    x = Math.max(content.left + 1, Math.min(content.right - 1, x))
+    element = root.elementFromPoint(x, y)
+    if (element && !view.contentDOM.contains(element)) element = null
+  }
 
   // There's visible editor content under the point, so we can try
   // using caret(Position|Range)FromPoint as a shortcut
   let node: Node | undefined, offset: number = -1
-  if (element && view.contentDOM.contains(element) && view.docView.nearest(element)?.isEditable != false) {
+  if (element && view.docView.nearest(element)?.isEditable != false) {
     if (doc.caretPositionFromPoint) {
       let pos = doc.caretPositionFromPoint(x, y)
       if (pos) ({offsetNode: node, offset} = pos)
@@ -166,7 +183,8 @@ export function posAtCoords(view: EditorView, {x, y}: {x: number, y: number}, pr
 
   // No luck, do our own (potentially expensive) search
   if (!node || !view.docView.dom.contains(node)) {
-    let line = LineView.find(view.docView, lineStart)!
+    let line = LineView.find(view.docView, lineStart)
+    if (!line) return yOffset > block.top + block.height / 2 ? block.to : block.from
     ;({node, offset} = domPosAtCoords(line.dom!, x, y))
   }
   return view.docView.posFromDOM(node, offset)
@@ -243,17 +261,17 @@ export function byGroup(view: EditorView, pos: number, start: string) {
 
 export function moveVertically(view: EditorView, start: SelectionRange, forward: boolean, distance?: number) {
   let startPos = start.head, dir: -1 | 1 = forward ? 1 : -1
-  if (startPos == (forward ? view.state.doc.length : 0)) return EditorSelection.cursor(startPos)
+  if (startPos == (forward ? view.state.doc.length : 0)) return EditorSelection.cursor(startPos, start.assoc)
   let goal = start.goalColumn, startY
   let rect = view.contentDOM.getBoundingClientRect()
-  let startCoords = view.coordsAtPos(startPos)
+  let startCoords = view.coordsAtPos(startPos), docTop = view.documentTop
   if (startCoords) {
     if (goal == null) goal = startCoords.left - rect.left
     startY = dir < 0 ? startCoords.top : startCoords.bottom
   } else {
-    let line = view.viewState.lineAt(startPos, view.dom.getBoundingClientRect().top)
+    let line = view.viewState.lineBlockAt(startPos - docTop)
     if (goal == null) goal = Math.min(rect.right - rect.left, view.defaultCharacterWidth * (startPos - line.from))
-    startY = dir < 0 ? line.top : line.bottom
+    startY = (dir < 0 ? line.top : line.bottom) + docTop
   }
   let resolvedGoal = rect.left + goal
   let dist = distance ?? (view.defaultLineHeight >> 1)
@@ -261,7 +279,7 @@ export function moveVertically(view: EditorView, start: SelectionRange, forward:
     let curY = startY + (dist + extra) * dir
     let pos = posAtCoords(view, {x: resolvedGoal, y: curY}, false, dir)!
     if (curY < rect.top || curY > rect.bottom || (dir < 0 ? pos < startPos : pos > startPos))
-      return EditorSelection.cursor(pos, undefined, undefined, goal)
+      return EditorSelection.cursor(pos, start.assoc, undefined, goal)
   }
 }
 

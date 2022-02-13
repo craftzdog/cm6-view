@@ -60,7 +60,8 @@ interface ReplaceDecorationSpec {
   widget?: WidgetType
   /// Whether this range covers the positions on its sides. This
   /// influences whether new content becomes part of the range and
-  /// whether the cursor can be drawn on its sides. Defaults to false.
+  /// whether the cursor can be drawn on its sides. Defaults to false
+  /// for inline replacements, and true for block replacements.
   inclusive?: boolean
   /// Set inclusivity at the start.
   inclusiveStart?: boolean
@@ -75,6 +76,8 @@ interface ReplaceDecorationSpec {
 interface LineDecorationSpec {
   /// DOM attributes to add to the element wrapping the line.
   attributes?: {[key: string]: string}
+  /// Shorthand for `{attributes: {class: value}}`.
+  class?: string
   /// Other properties are allowed.
   [other: string]: any
 }
@@ -122,6 +125,10 @@ export abstract class WidgetType {
 
   /// @internal
   get customView(): null | typeof WidgetView { return null }
+
+  /// This is called when the an instance of the widget is removed
+  /// from the editor view.
+  destroy(_dom: HTMLElement) {}
 }
 
 /// A decoration set represents a collection of decorated ranges,
@@ -129,7 +136,19 @@ export abstract class WidgetType {
 /// [`RangeSet`](#rangeset.RangeSet) for its methods.
 export type DecorationSet = RangeSet<Decoration>
 
-const enum Side { BigInline = 1e8, BigBlock = 2e8 }
+const enum Side {
+  NonIncEnd = -5e8, // (end of non-inclusive range)
+  BlockBefore = -4e8, // + widget side option (block widget before)
+  BlockIncStart = -3e8, // (start of inclusive block range)
+  Line = -2e8, // (line widget)
+  InlineBefore = -1e8, // + widget side (inline widget before)
+  InlineIncStart = -1, // (start of inclusive inline range)
+  InlineIncEnd = 1, // (end of inclusive inline range)
+  InlineAfter = 1e8, // + widget side (inline widget after)
+  BlockIncEnd = 2e8, // (end of inclusive block range)
+  BlockAfter = 3e8, // + widget side (block widget after)
+  NonIncStart = 4e8 // (start of non-inclusive range)
+}
 
 /// The different types of blocks that can occur in an editor view.
 export enum BlockType {
@@ -183,18 +202,18 @@ export abstract class Decoration extends RangeValue {
   /// Create a widget decoration, which adds an element at the given
   /// position.
   static widget(spec: WidgetDecorationSpec): Decoration {
-    let side = spec.side || 0
-    if (spec.block) side += (Side.BigBlock + 1) * (side > 0 ? 1 : -1)
-    return new PointDecoration(spec, side, side, !!spec.block, spec.widget || null, false)
+    let side = spec.side || 0, block = !!spec.block
+    side += block ? (side > 0 ? Side.BlockAfter : Side.BlockBefore) : (side > 0 ? Side.InlineAfter : Side.InlineBefore)
+    return new PointDecoration(spec, side, side, block, spec.widget || null, false)
   }
 
   /// Create a replace decoration which replaces the given range with
   /// a widget, or simply hides it.
   static replace(spec: ReplaceDecorationSpec): Decoration {
     let block = !!spec.block
-    let {start, end} = getInclusive(spec)
-    let startSide = block ? -Side.BigBlock * (start ? 2 : 1) : Side.BigInline * (start ? -1 : 1)
-    let endSide = block ? Side.BigBlock * (end ? 2 : 1) : Side.BigInline * (end ? 1 : -1)
+    let {start, end} = getInclusive(spec, block)
+    let startSide = (start ? (block ? Side.BlockIncStart : Side.InlineIncStart) : Side.NonIncStart) - 1
+    let endSide = (end ? (block ? Side.BlockIncEnd : Side.InlineIncEnd) : Side.NonIncEnd) + 1
     return new PointDecoration(spec, startSide, endSide, block, spec.widget || null, true)
   }
 
@@ -225,8 +244,8 @@ export class MarkDecoration extends Decoration {
 
   constructor(spec: MarkDecorationSpec) {
     let {start, end} = getInclusive(spec)
-    super(Side.BigInline * (start ? -1 : 1),
-          Side.BigInline * (end ? 1 : -1),
+    super(start ? Side.InlineIncStart : Side.NonIncStart,
+          end ? Side.InlineIncEnd : Side.NonIncEnd,
           null, spec)
     this.tagName = spec.tagName || "span"
     this.class = spec.class || ""
@@ -251,7 +270,7 @@ MarkDecoration.prototype.point = false
 
 export class LineDecoration extends Decoration {
   constructor(spec: LineDecorationSpec) {
-    super(-Side.BigInline, -Side.BigInline, null, spec)
+    super(Side.Line, Side.Line, null, spec)
   }
 
   eq(other: Decoration): boolean {
@@ -274,13 +293,13 @@ export class PointDecoration extends Decoration {
               widget: WidgetType | null,
               readonly isReplace: boolean) {
     super(startSide, endSide, widget, spec)
-    this.mapMode = !block ? MapMode.TrackDel : startSide < 0 ? MapMode.TrackBefore : MapMode.TrackAfter
+    this.mapMode = !block ? MapMode.TrackDel : startSide <= 0 ? MapMode.TrackBefore : MapMode.TrackAfter
   }
 
   // Only relevant when this.block == true
   get type() {
     return this.startSide < this.endSide ? BlockType.WidgetRange
-      : this.startSide < 0 ? BlockType.WidgetBefore : BlockType.WidgetAfter
+      : this.startSide <= 0 ? BlockType.WidgetBefore : BlockType.WidgetAfter
   }
 
   get heightRelevant() { return this.block || !!this.widget && this.widget.estimatedHeight >= 5 }
@@ -293,7 +312,7 @@ export class PointDecoration extends Decoration {
   }
 
   range(from: number, to = from) {
-    if (this.isReplace && (from > to || (from == to && this.startSide > 0 && this.endSide < 0)))
+    if (this.isReplace && (from > to || (from == to && this.startSide > 0 && this.endSide <= 0)))
       throw new RangeError("Invalid range for replacement decoration")
     if (!this.isReplace && to != from)
       throw new RangeError("Widget decorations can only have zero-length ranges")
@@ -303,11 +322,15 @@ export class PointDecoration extends Decoration {
 
 PointDecoration.prototype.point = true
 
-function getInclusive(spec: {inclusive?: boolean, inclusiveStart?: boolean, inclusiveEnd?: boolean}): {start: boolean, end: boolean} {
+function getInclusive(spec: {
+  inclusive?: boolean,
+  inclusiveStart?: boolean,
+  inclusiveEnd?: boolean
+}, block = false): {start: boolean, end: boolean} {
   let {inclusiveStart: start, inclusiveEnd: end} = spec
   if (start == null) start = spec.inclusive
   if (end == null) end = spec.inclusive
-  return {start: start || false, end: end || false}
+  return {start: start ?? block, end: end ?? block}
 }
 
 function widgetsEq(a: WidgetType | null, b: WidgetType | null): boolean {
@@ -316,6 +339,6 @@ function widgetsEq(a: WidgetType | null, b: WidgetType | null): boolean {
 
 export function addRange(from: number, to: number, ranges: number[], margin = 0) {
   let last = ranges.length - 1
-  if (last >= 0 && ranges[last] + margin > from) ranges[last] = Math.max(ranges[last], to)
+  if (last >= 0 && ranges[last] + margin >= from) ranges[last] = Math.max(ranges[last], to)
   else ranges.push(from, to)
 }

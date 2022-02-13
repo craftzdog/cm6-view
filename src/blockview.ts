@@ -1,23 +1,19 @@
-import {ContentView, DOMPos, Dirty} from "./contentview"
+import {ContentView, DOMPos, Dirty, noChildren, mergeChildrenInto} from "./contentview"
 import {DocView} from "./docview"
-import {InlineView, TextView, MarkView,
-        mergeInlineChildren, inlineDOMAtPos, joinInlineInto, coordsInChildren} from "./inlineview"
-import {clientRectsFor, Rect} from "./dom"
+import {TextView, MarkView, inlineDOMAtPos, joinInlineInto, coordsInChildren} from "./inlineview"
+import {clientRectsFor, Rect, clearAttributes} from "./dom"
 import {LineDecoration, WidgetType, BlockType} from "./decoration"
 import {Attrs, combineAttrs, attrsEq, updateAttrs} from "./attributes"
 import browser from "./browser"
 import {Text} from "@codemirror/state"
 
 export interface BlockView extends ContentView {
-  merge(from: number, to: number, source: ContentView | null, takeDeco: boolean, openStart: number, openEnd: number): boolean
-  match(other: BlockView): boolean
-  split(at: number): BlockView
   type: BlockType
   dom: HTMLElement | null
 }
 
 export class LineView extends ContentView implements BlockView {
-  children: InlineView[] = []
+  children: ContentView[] = []
   length: number = 0
   dom!: HTMLElement | null
   prevAttrs: Attrs | null | undefined = undefined
@@ -25,13 +21,13 @@ export class LineView extends ContentView implements BlockView {
   breakAfter = 0
 
   // Consumes source
-  merge(from: number, to: number, source: BlockView | null, takeDeco: boolean, openStart: number, openEnd: number): boolean {
+  merge(from: number, to: number, source: BlockView | null, hasStart: boolean, openStart: number, openEnd: number): boolean {
     if (source) {
       if (!(source instanceof LineView)) return false
       if (!this.dom) source.transferDOM(this) // Reuse source.dom when appropriate
     }
-    if (takeDeco) this.setDeco(source ? source.attrs : null)
-    mergeInlineChildren(this, from, to, source ? source.children : none, openStart, openEnd)
+    if (hasStart) this.setDeco(source ? source.attrs : null)
+    mergeChildrenInto(this, from, to, source ? source.children : [], openStart, openEnd)
     return true
   }
 
@@ -41,12 +37,12 @@ export class LineView extends ContentView implements BlockView {
     if (this.length == 0) return end
     let {i, off} = this.childPos(at)
     if (off) {
-      end.append(this.children[i].slice(off), 0)
-      this.children[i].merge(off, this.children[i].length, null, 0, 0)
+      end.append(this.children[i].split(off), 0)
+      this.children[i].merge(off, this.children[i].length, null, false, 0, 0)
       i++
     }
     for (let j = i; j < this.children.length; j++) end.append(this.children[j], 0)
-    while (i > 0 && this.children[i - 1].length == 0) { this.children[i - 1].parent = null; i-- }
+    while (i > 0 && this.children[i - 1].length == 0) this.children[--i].destroy()
     this.children.length = i
     this.markDirty()
     this.length = at
@@ -71,24 +67,35 @@ export class LineView extends ContentView implements BlockView {
     }
   }
 
-  // Only called when building a line view in ContentBuilder
-  append(child: InlineView, openStart: number) {
+  append(child: ContentView, openStart: number) {
     joinInlineInto(this, child, openStart)
   }
 
   // Only called when building a line view in ContentBuilder
   addLineDeco(deco: LineDecoration) {
-    let attrs = deco.spec.attributes
+    let attrs = deco.spec.attributes, cls = deco.spec.class
     if (attrs) this.attrs = combineAttrs(attrs, this.attrs || {})
+    if (cls) this.attrs = combineAttrs({class: cls}, this.attrs || {});
   }
 
   domAtPos(pos: number): DOMPos {
     return inlineDOMAtPos(this.dom!, this.children, pos)
   }
 
+  reuseDOM(node: Node) {
+    if (node.nodeName == "DIV") {
+      this.setDOM(node)
+      this.dirty |= Dirty.Attrs | Dirty.Node
+    }
+  }
+
   sync(track?: {node: Node, written: boolean}) {
-    if (!this.dom || (this.dirty & Dirty.Attrs)) {
+    if (!this.dom) {
       this.setDOM(document.createElement("div"))
+      this.dom!.className = "cm-line"
+      this.prevAttrs = this.attrs ? null : undefined
+    } else if (this.dirty & Dirty.Attrs) {
+      clearAttributes(this.dom)
       this.dom!.className = "cm-line"
       this.prevAttrs = this.attrs ? null : undefined
     }
@@ -127,23 +134,22 @@ export class LineView extends ContentView implements BlockView {
     return coordsInChildren(this, pos, side)
   }
 
-  match(_other: ContentView) { return false }
+  become(_other: ContentView) { return false }
 
   get type() { return BlockType.Text }
 
   static find(docView: DocView, pos: number): LineView | null {
-    for (let i = 0, off = 0;; i++) {
+    for (let i = 0, off = 0; i < docView.children.length; i++) {
       let block = docView.children[i], end = off + block.length
       if (end >= pos) {
         if (block instanceof LineView) return block
-        if (block.length) return null
+        if (end > pos) break
       }
       off = end + block.breakAfter
     }
+    return null
   }
 }
-
-const none = [] as any
 
 export class BlockWidgetView extends ContentView implements BlockView {
   dom!: HTMLElement | null
@@ -169,10 +175,12 @@ export class BlockWidgetView extends ContentView implements BlockView {
   split(at: number) {
     let len = this.length - at
     this.length = at
-    return new BlockWidgetView(this.widget, len, this.type)
+    let end = new BlockWidgetView(this.widget, len, this.type)
+    end.breakAfter = this.breakAfter
+    return end
   }
 
-  get children() { return none }
+  get children() { return noChildren }
 
   sync() {
     if (!this.dom || !this.widget.updateDOM(this.dom)) {
@@ -187,7 +195,7 @@ export class BlockWidgetView extends ContentView implements BlockView {
 
   domBoundsAround() { return null }
 
-  match(other: ContentView) {
+  become(other: ContentView) {
     if (other instanceof BlockWidgetView && other.type == this.type &&
         other.widget.constructor == this.widget.constructor) {
       if (!other.widget.eq(this.widget)) this.markDirty(true)
@@ -201,4 +209,9 @@ export class BlockWidgetView extends ContentView implements BlockView {
 
   ignoreMutation(): boolean { return true }
   ignoreEvent(event: Event): boolean { return this.widget.ignoreEvent(event) }
+
+  destroy() {
+    super.destroy()
+    if (this.dom) this.widget.destroy(this.dom)
+  }
 }

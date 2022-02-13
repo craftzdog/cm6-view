@@ -1,3 +1,333 @@
+## 0.19.42 (2022-02-05)
+
+### Bug fixes
+
+Fix a regression in cursor position determination after making an edit next to a widget.
+
+## 0.19.41 (2022-02-04)
+
+### Bug fixes
+
+Fix an issue where the editor's view of its content height could go out of sync with the DOM when a line-wrapping editor had its width changed, causing wrapping to change.
+
+Fix a bug that caused the editor to draw way too much content when scrolling to a position in an editor (much) taller than the window.
+
+Report an error when a replace decoration from a plugin crosses a line break, rather than silently ignoring it.
+
+Fix an issue where reading DOM changes was broken when `lineSeparator` contained more than one character.
+
+Make ordering of replace and mark decorations with the same extent and inclusivness more predictable by giving replace decorations precedence.
+
+Fix a bug where, on Chrome, replacement across line boundaries and next to widgets could cause bogus zero-width characters to appear in the content.
+
+## 0.19.40 (2022-01-19)
+
+### Bug fixes
+
+Make composition input properly appear at secondary cursors (except when those are in the DOM node with the composition, in which case the browser won't allow us to intervene without aborting the composition).
+
+Fix a bug that cause the editor to get confused about which content was visible after scrolling something into view.
+
+Fix a bug where the dummy elements rendered around widgets could end up in a separate set of wrapping marks, and thus become visible.
+
+`EditorView.moveVertically` now preserves the `assoc` property of the input range.
+
+Get rid of gaps between selection elements drawn by `drawSelection`.
+
+Fix an issue where replacing text next to a widget might leak bogus zero-width spaces into the document.
+
+Avoid browser selection mishandling when a focused view has `setState` called by eagerly refocusing it.
+
+## 0.19.39 (2022-01-06)
+
+### Bug fixes
+
+Make sure the editor signals a `geometryChanged` update when its width changes.
+
+### New features
+
+`EditorView.darkTheme` can now be queried to figure out whether the editor is using a dark theme.
+
+## 0.19.38 (2022-01-05)
+
+### Bug fixes
+
+Fix a bug that caused line decorations with a `class` property to suppress all other line decorations for that line.
+
+Fix a bug that caused scroll effects to be corrupted when further updates came in before they were applied.
+
+Fix an issue where, depending on which way a floating point rounding error fell, `posAtCoords` (and thus vertical cursor motion) for positions outside of the vertical range of the document might or might not return the start/end of the document.
+
+## 0.19.37 (2021-12-22)
+
+### Bug fixes
+
+Fix regression where plugin replacing decorations that span to the end of the line are ignored.
+
+## 0.19.36 (2021-12-22)
+
+### Bug fixes
+
+Fix a crash in `posAtCoords` when the position lies in a block widget that is rendered but scrolled out of view.
+
+Adding block decorations from a plugin now raises an error. Replacing decorations that cross lines are ignored, when provided by a plugin.
+
+Fix inverted interpretation of the `precise` argument to `posAtCoords`.
+
+## 0.19.35 (2021-12-20)
+
+### Bug fixes
+
+The editor will now handle double-taps as if they are double-clicks, rather than letting the browser's native behavior happen (because the latter often does the wrong thing).
+
+Fix an issue where backspacing out a selection on Chrome Android would sometimes only delete the last character due to event order issues.
+
+`posAtCoords`, without second argument, will no longer return null for positions below or above the document.
+
+## 0.19.34 (2021-12-17)
+
+### Bug fixes
+
+Fix a bug where content line elements would in some cases lose their `cm-line` class.
+
+## 0.19.33 (2021-12-16)
+
+### Breaking changes
+
+`EditorView.scrollTo` and `EditorView.centerOn` are deprecated in favor of `EditorView.scrollIntoView`, and will be removed in the next breaking release.
+
+### Bug fixes
+
+Fix an issue that could cause the editor to unnecessarily interfere with composition (especially visible on macOS Chrome).
+
+A composition started with multiple lines selected will no longer be interruptd by the editor.
+
+### New features
+
+The new `EditorView.scrollIntoView` function allows you to do more fine-grained scrolling.
+
+## 0.19.32 (2021-12-15)
+
+### Bug fixes
+
+Fix a bug where CodeMirror's own event handers would run even after a user-supplied handler called `preventDefault` on an event.
+
+Properly draw selections when negative text-indent is used for soft wrapping.
+
+Fix an issue where `viewportLineBlocks` could hold inaccurate height information when the vertical scaling changed.
+
+Fixes drop cursor positioning when the document is scrolled. Force a content measure when the editor comes into view
+
+Fix a bug that could cause the editor to not measure its layout the first time it came into view.
+
+## 0.19.31 (2021-12-13)
+
+### New features
+
+The package now exports a `dropCursor` extension that draws a cursor at the current drop position when dragging content over the editor.
+
+## 0.19.30 (2021-12-13)
+
+### Bug fixes
+
+Refine Android key event handling to work properly in a GBoard corner case where pressing Enter fires a bunch of spurious deleteContentBackward events.
+
+Fix a crash in `drawSelection` for some kinds of selections.
+
+Prevent a possibility where some content updates causes duplicate text to remain in DOM.
+
+### New features
+
+Support a `maxLength` option to `MatchDecorator` that allows user code to control how far it scans into hidden parts of viewport lines.
+
+## 0.19.29 (2021-12-09)
+
+### Bug fixes
+
+Fix a bug that could cause out-of-view editors to get a nonsensical viewport and fail to scroll into view when asked to.
+
+Fix a bug where  would return 0 when clicking below the content if the last line was replaced with a block widget decoration.
+
+Fix an issue where clicking at the position of the previous cursor in a blurred editor would cause the selection to reset to the start of the document.
+
+Fix an issue where composition could be interrupted if the browser created a new node inside a mark decoration node.
+
+## 0.19.28 (2021-12-08)
+
+### Bug fixes
+
+Fix an issue where pressing Enter on Chrome Android during composition did not fire key handlers for Enter.
+
+Avoid a Chrome bug where the virtual keyboard closes when pressing backspace after a widget.
+
+Fix an issue where the editor could show a horizontal scroll bar even after all lines that caused it had been deleted or changed.
+
+## 0.19.27 (2021-12-06)
+
+### Bug fixes
+
+Fix a bug that could cause `EditorView.plugin` to inappropriately return `null` during plugin initialization.
+
+Fix a bug where a block widget without `estimatedHeight` at the end of the document could fail to be drawn
+
+## 0.19.26 (2021-12-03)
+
+### New features
+
+Widgets can now define a `destroy` method that is called when they are removed from the view.
+
+## 0.19.25 (2021-12-02)
+
+### Bug fixes
+
+Widgets around replaced ranges are now visible when their side does not point towards the replaced range.
+
+A replaced line with a line decoration no longer creates an extra empty line block in the editor.
+
+The `scrollPastEnd` extension will now over-reserve space at the bottom of the editor on startup, to prevent restored scroll positions from being clipped.
+
+### New features
+
+`EditorView.editorAttributes` and `contentAttributes` may now hold functions that produce the attributes.
+
+## 0.19.24 (2021-12-01)
+
+### Bug fixes
+
+Fix a bug where `lineBlockAt`, for queries inside the viewport, would always return the first line in the viewport.
+
+## 0.19.23 (2021-11-30)
+
+### Bug fixes
+
+Fix an issue where after some kinds of changes, `EditorView.viewportLineBlocks` held an out-of-date set of blocks.
+
+### New features
+
+Export `EditorView.documentPadding`, with information about the vertical padding of the document.
+
+## 0.19.22 (2021-11-30)
+
+### Bug fixes
+
+Fix an issue where editors with large vertical padding (for example via `scrollPastEnd`) could sometimes lose their scroll position on Chrome.
+
+Avoid some unnecessary DOM measuring work by more carefully checking whether it is needed.
+
+### New features
+
+The new `elementAtHeight`, `lineBlockAtHeight`, and `lineBlockAt` methods provide a simpler and more efficient replacement for the (now deprecated) `blockAtHeight`, `visualLineAtHeight`, and `visualLineAt` methods.
+
+The editor view now exports a `documentTop` getter that gives you the vertical position of the top of the document. All height info is queried and reported relative to this top.
+
+The editor view's new `viewportLineBlocks` property provides an array of in-viewport line blocks, and replaces the (now deprecated) `viewportLines` method.
+
+## 0.19.21 (2021-11-26)
+
+### Bug fixes
+
+Fix a problem where the DOM update would unnecessarily trigger browser relayouts.
+
+## 0.19.20 (2021-11-19)
+
+### Bug fixes
+
+Run a measure cycle when the editor's size spontaneously changes.
+
+## 0.19.19 (2021-11-17)
+
+### Bug fixes
+
+Fix a bug that caused the precedence of `editorAttributes` and `contentAttributes` to be inverted, making lower-precedence extensions override higher-precedence ones.
+
+## 0.19.18 (2021-11-16)
+
+### Bug fixes
+
+Fix an issue where the editor wasn't aware it was line-wrapping with its own `lineWrapping` extension enabled.
+
+## 0.19.17 (2021-11-16)
+
+### Bug fixes
+
+Avoid an issue where stretches of whitespace on line wrap points could cause the cursor to be placed outside of the content.
+
+## 0.19.16 (2021-11-11)
+
+### Breaking changes
+
+Block replacement decorations now default to inclusive, because non-inclusive block decorations are rarely what you need.
+
+### Bug fixes
+
+Fix an issue that caused block widgets to always have a large side value, making it impossible to show them between to replacement decorations.
+
+Fix a crash that could happen after some types of viewport changes, due to a bug in the block widget view data structure.
+
+## 0.19.15 (2021-11-09)
+
+### Bug fixes
+
+Fix a bug where the editor would think it was invisible when the document body was given screen height and scroll behavior.
+
+Fix selection reading inside a shadow root on iOS.
+
+## 0.19.14 (2021-11-07)
+
+### Bug fixes
+
+Fix an issue where typing into a read-only editor would move the selection.
+
+Fix slowness when backspace is held down on iOS.
+
+## 0.19.13 (2021-11-06)
+
+### Bug fixes
+
+Fix a bug where backspace, enter, and delete would get applied twice on iOS.
+
+## 0.19.12 (2021-11-04)
+
+### Bug fixes
+
+Make sure the workaround for the lost virtual keyboard on Chrome Android also works on slower phones. Slight style change in beforeinput handler
+
+Avoid failure cases in viewport-based rendering of very long lines.
+
+## 0.19.11 (2021-11-03)
+
+### Breaking changes
+
+`EditorView.scrollPosIntoView` has been deprecated. Use the `EditorView.scrollTo` effect instead.
+
+### New features
+
+The new `EditorView.centerOn` effect can be used to scroll a given range to the center of the view.
+
+## 0.19.10 (2021-11-02)
+
+### Bug fixes
+
+Don't crash when `IntersectionObserver` fires its callback without any records. Try to handle some backspace issues on Chrome Android
+
+Using backspace near uneditable widgets on Chrome Android should now be more reliable.
+
+Work around a number of browser bugs by always rendering zero-width spaces around in-content widgets, so that browsers will treat the positions near them as valid cursor positions and not try to run composition across widget boundaries.
+
+Work around bogus composition changes created by Chrome Android after handled backspace presses.
+
+Work around an issue where tapping on an uneditable node in the editor would sometimes fail to show the virtual keyboard on Chrome Android.
+
+Prevent translation services from translating the editor content. Show direction override characters as special chars by default
+
+`specialChars` will now, by default, replace direction override chars, to mitigate https://trojansource.codes/ attacks.
+
+### New features
+
+The editor view will, if `parent` is given but `root` is not, derive the root from the parent element.
+
+Line decorations now accept a `class` property to directly add DOM classes to the line.
+
 ## 0.19.9 (2021-10-01)
 
 ### Bug fixes

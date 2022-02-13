@@ -1,4 +1,4 @@
-import {EditorView, Decoration, DecorationSet, WidgetType, Range} from "@codemirror/view"
+import {EditorView, Decoration, DecorationSet, WidgetType, Range, ViewPlugin} from "@codemirror/view"
 import {tempView, requireFocus} from "@codemirror/buildhelper/lib/tempview"
 import {EditorSelection, StateEffect, StateField} from "@codemirror/state"
 import ist from "ist"
@@ -39,7 +39,7 @@ function l(pos: number, attrs: any) {
 }
 
 function decoEditor(doc: string, decorations: any = []) {
-  return tempView(doc, decos(Decoration.set(decorations)))
+  return tempView(doc, decos(Decoration.set(decorations, true)))
 }
 
 describe("EditorView decoration", () => {
@@ -309,19 +309,37 @@ describe("EditorView decoration", () => {
 
     it("draws buffers around widgets", () => {
       let cm = tempView("1234", [decos(Decoration.set([w(1, new WordWidget("x"), 1), w(3, new WordWidget("y"), -1)]))])
-      ist(cm.contentDOM.textContent!.replace(/\u200b/g, "_"), "1_x23y_4")
+      ist(cm.contentDOM.innerHTML.replace(/<img.*?>/g, "#").replace(/<\/?\w+[^>]*>/g, ""), "1#x23y#4")
     })
 
     it("doesn't draw unnecessary buffers between adjacent widgets", () => {
       let cm = tempView("1234", [decos(Decoration.set([w(1, new WordWidget("x"), 1), w(1, new WordWidget("x"), 1),
                                                        w(3, new WordWidget("x"), -1), w(3, new WordWidget("x"), -1)]))])
-      ist(cm.contentDOM.textContent!.replace(/\u200b/g, "_"), "1_xx23xx_4")
+      ist(cm.contentDOM.innerHTML.replace(/<img.*?>/g, "#").replace(/<\/?\w+[^>]*>/g, ""), "1#xx23xx#4")
+    })
+
+    it("doesn't wrap buffers at the start of a mark in the mark", () => {
+      let cm = tempView("abc", [decos(Decoration.set([w(1, new WordWidget("x")), d(1, 2, "m")]))])
+      ist(cm.contentDOM.querySelectorAll("[m]").length, 1)
+    })
+
+    it("calls the destroy method on destroyed widgets", () => {
+      let destroyed: string[] = []
+      class W extends WordWidget {
+        destroy() { destroyed.push(this.word) }
+      }
+      let w1 = new W("A"), w2 = new W("B")
+      let cm = tempView("abcde", [decos(Decoration.set([w(1, w1), w(2, w2), w(4, w2)]))])
+      cm.dispatch({changes: {from: 0, to: 3}})
+      ist(destroyed.sort().join(), "A,B")
+      cm.dispatch({changes: {from: 0, to: 2}})
+      ist(destroyed.sort().join(), "A,B,B")
     })
   })
 
-  describe("replaced", () => {
-    function r(from: number, to: number, spec: any = {}) { return Decoration.replace(spec).range(from, to) }
+  function r(from: number, to: number, spec: any = {}) { return Decoration.replace(spec).range(from, to) }
 
+  describe("replaced", () => {
     it("omits replaced content", () => {
       let cm = decoEditor("foobar", [r(1, 4)])
       ist(text(cm.contentDOM), "far")
@@ -387,7 +405,36 @@ describe("EditorView decoration", () => {
       let cm = tempView("12345", [decos(Decoration.set([r(0, 1, {widget: new WordWidget("a")}),
                                                         r(2, 3, {widget: new WordWidget("b")}),
                                                         r(4, 5, {widget: new WordWidget("c")})]))])
-      ist(cm.contentDOM.textContent!.replace(/\u200b/g, "_"), "_a_2_b_4_c_")
+      ist(cm.contentDOM.innerHTML.replace(/<img.*?>/g, "#").replace(/<\/?\w+[^>]*>/g, ""), "#a#2#b#4#c#")
+    })
+
+    it("properly handles marks growing to include replaced ranges", () => {
+      let cm = tempView("1\n2\n3\n4", [
+        EditorView.decorations.of(Decoration.set(r(4, 5, {widget: new WordWidget("×")}))),
+        decos(Decoration.none),
+      ])
+      cm.dispatch({effects: addDeco.of([d(4, 6, {class: "a"})])})
+      cm.dispatch({effects: [filterDeco.of(() => false), addDeco.of([d(2, 6, {class: "a"})])]})
+      ist(cm.contentDOM.querySelectorAll("strong").length, 1)
+    })
+
+    it("covers block ranges at the end of a replaced range", () => {
+      let cm = tempView("1\n2\n3\n4", [
+        EditorView.decorations.of(Decoration.set([r(4, 5, {widget: new WordWidget("B"), block: true})])),
+        EditorView.decorations.of(Decoration.set([r(1, 5, {widget: new WordWidget("F")})])),
+      ])
+      ist(cm.contentDOM.querySelectorAll("strong").length, 1)
+    })
+
+    it("raises errors for replacing decorations from plugins if they cross lines", () => {
+      ist.throws(() => {
+        tempView("one\ntwo", [ViewPlugin.fromClass(class {
+          update!: () => void
+          deco = Decoration.set(Decoration.replace({widget: new WordWidget("ay")}).range(2, 5))
+        }, {
+          decorations: o => o.deco
+        })])
+      }, "Decorations that replace line breaks may not be specified via plugins")
     })
   })
 
@@ -452,7 +499,7 @@ describe("EditorView decoration", () => {
     return Decoration.widget({widget: new BlockWidget(name), side, block: true}).range(pos)
   }
 
-  function br(from: number, to: number, name = "r", inclusive = false) {
+  function br(from: number, to: number, name = "r", inclusive?: boolean) {
     return Decoration.replace({widget: new BlockWidget(name), inclusive, block: true}).range(from, to)
   }
 
@@ -551,6 +598,44 @@ describe("EditorView decoration", () => {
         effects: [filterDeco.of(_ => false), addDeco.of([br(1, 3, "X"), br(7, 9, "X")])]
       })
       widgets(cm, [], ["X"], ["X"], [])
+    })
+
+    it("block replacements cover inline widgets but not block widgets on their sides", () => {
+      let cm = decoEditor("1\n2\n3", [
+        br(2, 3, "X"),
+        w(2, new WordWidget("I1"), -1), w(3, new WordWidget("I1"), 1),
+        bw(2, -1, "B1"), bw(3, 1, "B2")
+      ])
+      ist(!cm.contentDOM.querySelector("strong"))
+      widgets(cm, [], ["B1", "X", "B2"], [])
+    })
+
+    it("block replacements cover inline replacements at their sides", () => {
+      let cm = decoEditor("1\n234\n5", [
+        br(2, 5, "X"),
+        r(2, 3, {widget: new WordWidget("I1"), inclusive: true}),
+        r(4, 5, {widget: new WordWidget("I1"), inclusive: true}),
+      ])
+      ist(!cm.contentDOM.querySelector("strong"))
+    })
+
+    it("doesn't draw replaced lines even when decorated", () => {
+      let cm = decoEditor("1\n234\n5", [
+        br(2, 5, "X"),
+        l(2, {class: "line"})
+      ])
+      ist(!cm.contentDOM.querySelector(".line"))
+    })
+
+    it("raises an error when providing block widgets from plugins", () => {
+      ist.throws(() => {
+        tempView("abc", [ViewPlugin.fromClass(class {
+          update!: () => void
+          deco = Decoration.set(Decoration.replace({widget: new BlockWidget("oh"), block: true}).range(1, 2))
+        }, {
+          decorations: o => o.deco
+        })])
+      }, "Block decorations may not be specified via plugins")
     })
   })
 })

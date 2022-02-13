@@ -11,11 +11,6 @@ export function getSelection(root: DocumentOrShadowRoot): Selection {
   return target.getSelection()!
 }
 
-export type SelectionRange = {
-  focusNode: Node | null, focusOffset: number,
-  anchorNode: Node | null, anchorOffset: number
-}
-
 export function contains(dom: HTMLElement, node: Node | null) {
   return node ? dom.contains(node.nodeType != 1 ? node.parentNode : node) : false
 }
@@ -105,12 +100,14 @@ function windowRect(win: Window): Rect {
           top: 0, bottom: win.innerHeight}
 }
 
-const ScrollSpace = 5
+export type ScrollStrategy = "nearest" | "start" | "end" | "center"
 
-export function scrollRectIntoView(dom: HTMLElement, rect: Rect, side: -1 | 1) {
+export function scrollRectIntoView(dom: HTMLElement, rect: Rect, side: -1 | 1,
+                                   x: ScrollStrategy, y: ScrollStrategy,
+                                   xMargin: number, yMargin: number, ltr: boolean) {
   let doc = dom.ownerDocument!, win = doc.defaultView!
 
-  for (let cur: any = dom.parentNode; cur;) {
+  for (let cur: any = dom; cur;) {
     if (cur.nodeType == 1) { // Element
       let bounding: Rect, top = cur == doc.body
       if (top) {
@@ -127,23 +124,40 @@ export function scrollRectIntoView(dom: HTMLElement, rect: Rect, side: -1 | 1) {
       }
 
       let moveX = 0, moveY = 0
-      if (rect.top < bounding.top) {
-        moveY = -(bounding.top - rect.top + ScrollSpace)
-        if (side > 0 && rect.bottom > bounding.bottom + moveY)
-          moveY = rect.bottom - bounding.bottom + moveY + ScrollSpace
-      } else if (rect.bottom > bounding.bottom) {
-        moveY = rect.bottom - bounding.bottom + ScrollSpace
-        if (side < 0 && (rect.top - moveY) < bounding.top)
-          moveY = -(bounding.top + moveY - rect.top + ScrollSpace)
+      if (y == "nearest") {
+        if (rect.top < bounding.top) {
+          moveY = -(bounding.top - rect.top + yMargin)
+          if (side > 0 && rect.bottom > bounding.bottom + moveY)
+            moveY = rect.bottom - bounding.bottom + moveY + yMargin
+        } else if (rect.bottom > bounding.bottom) {
+          moveY = rect.bottom - bounding.bottom + yMargin
+          if (side < 0 && (rect.top - moveY) < bounding.top)
+            moveY = -(bounding.top + moveY - rect.top + yMargin)
+        }
+      } else {
+        let rectHeight = rect.bottom - rect.top, boundingHeight = bounding.bottom - bounding.top
+        let targetTop =
+          y == "center" && rectHeight <= boundingHeight ? rect.top + rectHeight / 2 - boundingHeight / 2 :
+          y == "start" || y == "center" && side < 0 ? rect.top - yMargin :
+          rect.bottom - boundingHeight + yMargin
+        moveY = targetTop - bounding.top
       }
-      if (rect.left < bounding.left) {
-        moveX = -(bounding.left - rect.left + ScrollSpace)
-        if (side > 0 && rect.right > bounding.right + moveX)
-          moveX = rect.right - bounding.right + moveX + ScrollSpace
-      } else if (rect.right > bounding.right) {
-        moveX = rect.right - bounding.right + ScrollSpace
-        if (side < 0 && rect.left < bounding.left + moveX)
-          moveX = -(bounding.left + moveX - rect.left + ScrollSpace)
+      if (x == "nearest") {
+        if (rect.left < bounding.left) {
+          moveX = -(bounding.left - rect.left + xMargin)
+          if (side > 0 && rect.right > bounding.right + moveX)
+            moveX = rect.right - bounding.right + moveX + xMargin
+        } else if (rect.right > bounding.right) {
+          moveX = rect.right - bounding.right + xMargin
+          if (side < 0 && rect.left < bounding.left + moveX)
+            moveX = -(bounding.left + moveX - rect.left + xMargin)
+        }
+      } else {
+        let targetLeft =
+          x == "center" ? rect.left + (rect.right - rect.left) / 2 - (bounding.right - bounding.left) / 2 :
+          (x == "start") == ltr ? rect.left - xMargin :
+          rect.right - (bounding.right - bounding.left) + xMargin
+        moveX = targetLeft - bounding.left
       }
       if (moveX || moveY) {
         if (top) {
@@ -165,6 +179,7 @@ export function scrollRectIntoView(dom: HTMLElement, rect: Rect, side: -1 | 1) {
       }
       if (top) break
       cur = cur.assignedSlot || cur.parentNode
+      x = y = "nearest"
     } else if (cur.nodeType == 11) { // A shadow root
       cur = cur.host
     } else {
@@ -173,7 +188,12 @@ export function scrollRectIntoView(dom: HTMLElement, rect: Rect, side: -1 | 1) {
   }
 }
 
-export class DOMSelection {
+export interface SelectionRange {
+  focusNode: Node | null, focusOffset: number,
+  anchorNode: Node | null, anchorOffset: number
+}
+
+export class DOMSelectionState implements SelectionRange {
   anchorNode: Node | null = null
   anchorOffset: number = 0
   focusNode: Node | null = null
@@ -184,9 +204,13 @@ export class DOMSelection {
       this.focusNode == domSel.focusNode && this.focusOffset == domSel.focusOffset
   }
 
-  set(domSel: SelectionRange) {
-    this.anchorNode = domSel.anchorNode; this.anchorOffset = domSel.anchorOffset
-    this.focusNode = domSel.focusNode; this.focusOffset = domSel.focusOffset
+  setRange(range: SelectionRange) {
+    this.set(range.anchorNode, range.anchorOffset, range.focusNode, range.focusOffset)
+  }
+
+  set(anchorNode: Node | null, anchorOffset: number, focusNode: Node | null, focusOffset: number) {
+    this.anchorNode = anchorNode; this.anchorOffset = anchorOffset
+    this.focusNode = focusNode; this.focusOffset = focusOffset
   }
 }
 
@@ -238,24 +262,15 @@ export function dispatchKey(elt: HTMLElement, name: string, code: number): boole
   return down.defaultPrevented || up.defaultPrevented
 }
 
-let _plainTextSupported: boolean | null = null
-export function contentEditablePlainTextSupported() {
-  if (_plainTextSupported == null) {
-    _plainTextSupported = false
-    let dummy = document.createElement("div")
-    try {
-      dummy.contentEditable = "plaintext-only"
-      _plainTextSupported = dummy.contentEditable == "plaintext-only"
-    } catch(_) {}
-  }
-  return _plainTextSupported
-}
-
 export function getRoot(node: Node | null | undefined): DocumentOrShadowRoot | null {
   while (node) {
-    node = (node as HTMLElement).assignedSlot || node.parentNode
     if (node && (node.nodeType == 9 || node.nodeType == 11 && (node as ShadowRoot).host))
       return node as unknown as DocumentOrShadowRoot
+    node = (node as HTMLElement).assignedSlot || node.parentNode
   }
   return null
+}
+
+export function clearAttributes(node: HTMLElement) {
+  while(node.attributes.length) node.removeAttributeNode(node.attributes[0])
 }

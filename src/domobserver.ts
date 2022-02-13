@@ -2,7 +2,8 @@ import browser from "./browser"
 import {ContentView, Dirty} from "./contentview"
 import {EditorView} from "./editorview"
 import {editable} from "./extension"
-import {hasSelection, getSelection, DOMSelection, isEquivalentPosition, SelectionRange, deepActiveElement} from "./dom"
+import {hasSelection, getSelection, DOMSelectionState, isEquivalentPosition,
+        deepActiveElement, dispatchKey} from "./dom"
 
 const observeOptions = {
   childList: true,
@@ -21,22 +22,30 @@ export class DOMObserver {
 
   observer: MutationObserver
   active: boolean = false
-  ignoreSelection: DOMSelection = new DOMSelection
+
+  // The known selection. Kept in our own object, as opposed to just
+  // directly accessing the selection because:
+  //  - Safari doesn't report the right selection in shadow DOM
+  //  - Reading from the selection forces a DOM layout
+  //  - This way, we can ignore selectionchange events if we have
+  //    already seen the 'new' selection
+  selectionRange: DOMSelectionState = new DOMSelectionState
+  // Set when a selection change is detected, cleared on flush
+  selectionChanged = false
 
   delayedFlush = -1
+  resizeTimeout = -1
   queue: MutationRecord[] = []
-  lastFlush = 0
+  delayedAndroidKey: {key: string, keyCode: number} | null = null
 
   onCharData: any
 
   scrollTargets: HTMLElement[] = []
   intersection: IntersectionObserver | null = null
+  resize: ResizeObserver | null = null
   intersecting: boolean = false
   gapIntersection: IntersectionObserver | null = null
   gaps: readonly HTMLElement[] = []
-
-  // Used to work around a Safari Selection/shadow DOM bug (#414)
-  _selectionRange: SelectionRange | null = null
 
   // Timeout for scheduling check of the parents that need scroll handlers
   parentCheck = -1
@@ -47,7 +56,6 @@ export class DOMObserver {
     this.dom = view.contentDOM
     this.observer = new MutationObserver(mutations => {
       for (let mut of mutations) this.queue.push(mut)
-      this._selectionRange = null
       // IE11 will sometimes (on typing over a selection or
       // backspacing out a single character text node) call the
       // observer callback before actually updating the DOM.
@@ -74,6 +82,16 @@ export class DOMObserver {
       }
 
     this.onSelectionChange = this.onSelectionChange.bind(this)
+    if (typeof ResizeObserver == "function") {
+      this.resize = new ResizeObserver(() => {
+        if (this.view.docView.lastUpdate < Date.now() - 75 && this.resizeTimeout < 0)
+          this.resizeTimeout = setTimeout(() => {
+            this.resizeTimeout = -1
+            this.view.requestMeasure()
+          }, 50)
+      })
+      this.resize.observe(view.scrollDOM)
+    }
     this.start()
 
     this.onScroll = this.onScroll.bind(this)
@@ -81,7 +99,7 @@ export class DOMObserver {
     if (typeof IntersectionObserver == "function") {
       this.intersection = new IntersectionObserver(entries => {
         if (this.parentCheck < 0) this.parentCheck = setTimeout(this.listenForScroll.bind(this), 1000)
-        if (entries.length > 0 && entries[entries.length - 1].intersectionRatio > 0 != this.intersecting) {
+        if (entries.length > 0 && (entries[entries.length - 1].intersectionRatio > 0) != this.intersecting) {
           this.intersecting = !this.intersecting
           if (this.intersecting != this.view.inView)
             this.onScrollChanged(document.createEvent("Event"))
@@ -94,10 +112,12 @@ export class DOMObserver {
       }, {})
     }
     this.listenForScroll()
+    this.readSelectionRange()
+    this.dom.ownerDocument.addEventListener("selectionchange", this.onSelectionChange)
   }
 
   onScroll(e: Event) {
-    if (this.intersecting) this.flush()
+    if (this.intersecting) this.flush(false)
     this.onScrollChanged(e)
   }
 
@@ -110,40 +130,41 @@ export class DOMObserver {
   }
 
   onSelectionChange(event: Event) {
-    if (this.lastFlush < Date.now() - 50) this._selectionRange = null
+    if (!this.readSelectionRange() || this.delayedAndroidKey) return
     let {view} = this, sel = this.selectionRange
     if (view.state.facet(editable) ? view.root.activeElement != this.dom : !hasSelection(view.dom, sel))
       return
+
     let context = sel.anchorNode && view.docView.nearest(sel.anchorNode)
     if (context && context.ignoreEvent(event)) return
 
     // Deletions on IE11 fire their events in the wrong order, giving
     // us a selection change event before the DOM changes are
     // reported.
-    // (Selection.isCollapsed isn't reliable on IE)
-    if (browser.ie && browser.ie_version <= 11 && !view.state.selection.main.empty &&
-      sel.focusNode && isEquivalentPosition(sel.focusNode, sel.focusOffset, sel.anchorNode, sel.anchorOffset))
+    // Chrome Android has a similar issue when backspacing out a
+    // selection (#645).
+    if ((browser.ie && browser.ie_version <= 11 || browser.android && browser.chrome) && !view.state.selection.main.empty &&
+        // (Selection.isCollapsed isn't reliable on IE)
+        sel.focusNode && isEquivalentPosition(sel.focusNode, sel.focusOffset, sel.anchorNode, sel.anchorOffset))
       this.flushSoon()
     else
-      this.flush()
+      this.flush(false)
   }
 
-  get selectionRange(): SelectionRange {
-    if (!this._selectionRange) {
-      let {root} = this.view, sel: SelectionRange = getSelection(root)
-      // The Selection object is broken in shadow roots in Safari. See
-      // https://github.com/codemirror/codemirror.next/issues/414
-      if (browser.safari && (root as any).nodeType == 11 && deepActiveElement() == this.view.contentDOM)
-        sel = safariSelectionRangeHack(this.view) || sel
-      this._selectionRange = sel
-    }
-    return this._selectionRange
+  readSelectionRange() {
+    let {root} = this.view, domSel = getSelection(root)
+    // The Selection object is broken in shadow roots in Safari. See
+    // https://github.com/codemirror/codemirror.next/issues/414
+    let range = browser.safari && (root as any).nodeType == 11 && deepActiveElement() == this.view.contentDOM &&
+      safariSelectionRangeHack(this.view) || domSel
+    if (this.selectionRange.eq(range)) return false
+    this.selectionRange.setRange(range)
+    return this.selectionChanged = true
   }
 
   setSelectionRange(anchor: {node: Node, offset: number}, head: {node: Node, offset: number}) {
-    if (!(this._selectionRange as any)?.type)
-      this._selectionRange = {anchorNode: anchor.node, anchorOffset: anchor.offset,
-                              focusNode: head.node, focusOffset: head.offset}
+    this.selectionRange.set(anchor.node, anchor.offset, head.node, head.offset)
+    this.selectionChanged = false
   }
 
   listenForScroll() {
@@ -182,7 +203,6 @@ export class DOMObserver {
   start() {
     if (this.active) return
     this.observer.observe(this.dom, observeOptions)
-    this.dom.ownerDocument!.addEventListener("selectionchange", this.onSelectionChange)
     if (useCharData)
       this.dom.addEventListener("DOMCharacterDataModified", this.onCharData)
     this.active = true
@@ -192,20 +212,38 @@ export class DOMObserver {
     if (!this.active) return
     this.active = false
     this.observer.disconnect()
-    this.dom.ownerDocument!.removeEventListener("selectionchange", this.onSelectionChange)
     if (useCharData)
       this.dom.removeEventListener("DOMCharacterDataModified", this.onCharData)
-  }
-
-  clearSelection() {
-    this.ignoreSelection.set(this.selectionRange)
   }
 
   // Throw away any pending changes
   clear() {
     this.observer.takeRecords()
     this.queue.length = 0
-    this.clearSelection()
+    this.selectionChanged = false
+  }
+
+  // Chrome Android, especially in combination with GBoard, not only
+  // doesn't reliably fire regular key events, but also often
+  // surrounds the effect of enter or backspace with a bunch of
+  // composition events that, when interrupted, cause text duplication
+  // or other kinds of corruption. This hack makes the editor back off
+  // from handling DOM changes for a moment when such a key is
+  // detected (via beforeinput or keydown), and then dispatches the
+  // key event, throwing away the DOM changes if it gets handled.
+  delayAndroidKey(key: string, keyCode: number) {
+    if (!this.delayedAndroidKey) requestAnimationFrame(() => {
+      let key = this.delayedAndroidKey!
+      this.delayedAndroidKey = null
+      let startState = this.view.state
+      if (dispatchKey(this.view.contentDOM, key.key, key.keyCode)) this.processRecords()
+      else this.flush()
+      if (this.view.state == startState) this.view.update([])
+    })
+    // Since backspace beforeinput is sometimes signalled spuriously,
+    // Enter always takes precedence.
+    if (!this.delayedAndroidKey || key == "Enter")
+      this.delayedAndroidKey = {key, keyCode}
   }
 
   flushSoon() {
@@ -242,24 +280,24 @@ export class DOMObserver {
   }
 
   // Apply pending changes, if any
-  flush() {
+  flush(readSelection = true) {
     // Completely hold off flushing when pending keys are set—the code
     // managing those will make sure processRecords is called and the
     // view is resynchronized after
-    if (this.delayedFlush >= 0 || this.view.inputState.pendingKey) return
+    if (this.delayedFlush >= 0 || this.delayedAndroidKey) return
 
-    this.lastFlush = Date.now()
+    if (readSelection) this.readSelectionRange()
+
     let {from, to, typeOver} = this.processRecords()
-    let selection = this.selectionRange
-    let newSel = !this.ignoreSelection.eq(selection) && hasSelection(this.dom, selection)
+    let newSel = this.selectionChanged && hasSelection(this.dom, this.selectionRange)
     if (from < 0 && !newSel) return
 
+    this.selectionChanged = false
     let startState = this.view.state
     this.onChange(from, to, typeOver)
     
     // The view wasn't updated
-    if (this.view.state == startState) this.view.docView.reset(newSel)
-    this.clearSelection()
+    if (this.view.state == startState) this.view.update([])
   }
 
   readMutation(rec: MutationRecord): {from: number, to: number, typeOver: boolean} | null {
@@ -282,11 +320,14 @@ export class DOMObserver {
 
   destroy() {
     this.stop()
-    if (this.intersection) this.intersection.disconnect()
-    if (this.gapIntersection) this.gapIntersection.disconnect()
+    this.intersection?.disconnect()
+    this.gapIntersection?.disconnect()
+    this.resize?.disconnect()
     for (let dom of this.scrollTargets) dom.removeEventListener("scroll", this.onScroll)
     window.removeEventListener("scroll", this.onScroll)
+    this.dom.ownerDocument.removeEventListener("selectionchange", this.onSelectionChange)
     clearTimeout(this.parentCheck)
+    clearTimeout(this.resizeTimeout)
   }
 }
 
@@ -300,6 +341,7 @@ function findChild(cView: ContentView, dom: Node | null, dir: number): ContentVi
   return null
 }
 
+// Used to work around a Safari Selection/shadow DOM bug (#414)
 function safariSelectionRangeHack(view: EditorView) {
   let found = null as null | StaticRange
   // Because Safari (at least in 2018-2021) doesn't provide regular

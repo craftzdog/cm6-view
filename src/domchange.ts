@@ -1,19 +1,21 @@
 import {EditorView} from "./editorview"
-import {ContentView} from "./contentview"
 import {inputHandler, editable} from "./extension"
 import {contains, dispatchKey} from "./dom"
 import browser from "./browser"
+import {DOMReader, DOMPoint, LineBreakPlaceholder} from "./domreader"
+import {compositionSurroundingNode} from "./docview"
 import {EditorSelection, Text} from "@codemirror/state"
 
 export function applyDOMChange(view: EditorView, start: number, end: number, typeOver: boolean) {
   let change: undefined | {from: number, to: number, insert: Text}, newSel
-  let sel = view.state.selection.main, bounds
-  if (start > -1 && !view.state.readOnly && (bounds = view.docView.domBoundsAround(start, end, 0))) {
+  let sel = view.state.selection.main
+  if (start > -1) {
+    let bounds = view.docView.domBoundsAround(start, end, 0)
+    if (!bounds || view.state.readOnly) return
     let {from, to} = bounds
     let selPoints = view.docView.impreciseHead || view.docView.impreciseAnchor ? [] : selectionPoints(view)
-    let reader = new DOMReader(selPoints, view)
+    let reader = new DOMReader(selPoints, view.state)
     reader.readRange(bounds.startDOM, bounds.endDOM)
-    newSel = selectionFromPoints(selPoints, from)
 
     let preferredPos = sel.from, preferredSide = null
     // Prefer anchoring to end when Backspace is pressed (or, on
@@ -23,10 +25,19 @@ export function applyDOMChange(view: EditorView, start: number, end: number, typ
       preferredPos = sel.to
       preferredSide = "end"
     }
-    let diff = findDiff(view.state.sliceDoc(from, to), reader.text,
+    let diff = findDiff(view.state.doc.sliceString(from, to, LineBreakPlaceholder), reader.text,
                         preferredPos - from, preferredSide)
-    if (diff) change = {from: from + diff.from, to: from + diff.toA,
-                        insert: view.state.toText(reader.text.slice(diff.from, diff.toB))}
+    if (diff) {
+      // Chrome inserts two newlines when pressing shift-enter at the
+      // end of a line. This drops one of those.
+      if (browser.chrome && view.inputState.lastKeyCode == 13 &&
+          diff.toB == diff.from + 2 && reader.text.slice(diff.from, diff.toB) == LineBreakPlaceholder + LineBreakPlaceholder)
+        diff.toB--
+
+      change = {from: from + diff.from, to: from + diff.toA,
+                insert: Text.of(reader.text.slice(diff.from, diff.toB).split(LineBreakPlaceholder))}
+    }
+    newSel = selectionFromPoints(selPoints, from)
   } else if (view.hasFocus || !view.state.facet(editable)) {
     let domSel = view.observer.selectionRange
     let {impreciseHead: iHead, impreciseAnchor: iAnchor} = view.docView
@@ -60,10 +71,13 @@ export function applyDOMChange(view: EditorView, start: number, end: number, typ
 
   if (change) {
     let startState = view.state
+    if (browser.ios && view.inputState.flushIOSKey(view)) return
     // Android browsers don't fire reasonable key events for enter,
     // backspace, or delete. So this detects changes that look like
     // they're caused by those keys, and reinterprets them as key
-    // events.
+    // events. (Some of these keys are also handled by beforeinput
+    // events and the pendingAndroidKey mechanism, but that's not
+    // reliable in all situations.)
     if (browser.android &&
         ((change.from == sel.from && change.to == sel.to &&
           change.insert.length == 1 && change.insert.lines == 2 &&
@@ -71,9 +85,8 @@ export function applyDOMChange(view: EditorView, start: number, end: number, typ
          (change.from == sel.from - 1 && change.to == sel.to && change.insert.length == 0 &&
           dispatchKey(view.contentDOM, "Backspace", 8)) ||
          (change.from == sel.from && change.to == sel.to + 1 && change.insert.length == 0 &&
-          dispatchKey(view.contentDOM, "Delete", 46)))) {
+          dispatchKey(view.contentDOM, "Delete", 46))))
       return
-    }
 
     let text = change.insert.toString()
     if (view.state.facet(inputHandler).some(h => h(view, change!.from, change!.to, text)))
@@ -82,17 +95,45 @@ export function applyDOMChange(view: EditorView, start: number, end: number, typ
     if (view.inputState.composing >= 0) view.inputState.composing++
     let tr
     if (change.from >= sel.from && change.to <= sel.to && change.to - change.from >= (sel.to - sel.from) / 3 &&
-        (!newSel || newSel.main.empty && newSel.main.from == change.from + change.insert.length)) {
+        (!newSel || newSel.main.empty && newSel.main.from == change.from + change.insert.length) &&
+        view.inputState.composing < 0) {
       let before = sel.from < change.from ? startState.sliceDoc(sel.from, change.from) : ""
       let after = sel.to > change.to ? startState.sliceDoc(change.to, sel.to) : ""
-      tr = startState.replaceSelection(view.state.toText(before + change.insert.sliceString(0, undefined, view.state.lineBreak) +
-                                                         after))
+      tr = startState.replaceSelection(view.state.toText(
+        before + change.insert.sliceString(0, undefined, view.state.lineBreak) + after))
     } else {
       let changes = startState.changes(change)
-      tr = {
-        changes,
-        selection: newSel && !startState.selection.main.eq(newSel.main) && newSel.main.to <= changes.newLength
-          ? startState.selection.replaceRange(newSel.main) : undefined
+      let mainSel = newSel && !startState.selection.main.eq(newSel.main) && newSel.main.to <= changes.newLength
+        ? newSel.main : undefined
+      // Try to apply a composition change to all cursors
+      if (startState.selection.ranges.length > 1 && view.inputState.composing >= 0 &&
+          change.to <= sel.to && change.to >= sel.to - 10) {
+        let replaced = view.state.sliceDoc(change.from, change.to)
+        let compositionRange = compositionSurroundingNode(view) || view.state.doc.lineAt(sel.head)
+        let offset = sel.to - change.to, size = sel.to - sel.from
+        tr = startState.changeByRange(range => {
+          if (range.from == sel.from && range.to == sel.to)
+            return {changes, range: mainSel || range.map(changes)}
+          let to = range.to - offset, from = to - replaced.length
+          if (range.to - range.from != size || view.state.sliceDoc(from, to) != replaced ||
+              // Unfortunately, there's no way to make multiple
+              // changes in the same node work without aborting
+              // composition, so cursors in the composition range are
+              // ignored.
+              compositionRange && range.to >= compositionRange.from && range.from <= compositionRange.to)
+            return {range}
+          let rangeChanges = startState.changes({from, to, insert: change!.insert}), selOff = range.to - sel.to
+          return {
+            changes: rangeChanges,
+            range: !mainSel ? range.map(rangeChanges) :
+              EditorSelection.range(Math.max(0, mainSel.anchor + selOff), Math.max(0, mainSel.head + selOff))
+          }
+        })
+      } else {
+        tr = {
+          changes,
+          selection: mainSel && startState.selection.replaceRange(mainSel)
+        }
       }
     }
     let userEvent = "input.type"
@@ -139,74 +180,6 @@ function findDiff(a: string, b: string, preferredPos: number, preferredSide: str
     toB = from
   }
   return {from, toA, toB}
-}
-
-class DOMReader {
-  text: string = ""
-  private lineBreak: string
-
-  constructor(private points: DOMPoint[], private view: EditorView) {
-    this.lineBreak = view.state.lineBreak
-  }
-
-  readRange(start: Node | null, end: Node | null) {
-    if (!start) return
-    let parent = start.parentNode!
-    for (let cur = start;;) {
-      this.findPointBefore(parent, cur)
-      this.readNode(cur)
-      let next: Node | null = cur.nextSibling
-      if (next == end) break
-      let view = ContentView.get(cur), nextView = ContentView.get(next!)
-      if (view && nextView ? view.breakAfter :
-          (view ? view.breakAfter : isBlockElement(cur)) ||
-          (isBlockElement(next!) && (cur.nodeName != "BR" || (cur as any).cmIgnore)))
-        this.text += this.lineBreak
-      cur = next!
-    }
-    this.findPointBefore(parent, end)
-  }
-
-  readNode(node: Node) {
-    if ((node as any).cmIgnore) return
-    let view = ContentView.get(node)
-    let fromView = view && view.overrideDOMText
-    let text: string | undefined
-    if (fromView != null) text = fromView.sliceString(0, undefined, this.lineBreak)
-    else if (node.nodeType == 3) text = node.nodeValue!
-    else if (node.nodeName == "BR") text = node.nextSibling ? this.lineBreak : ""
-    else if (node.nodeType == 1) this.readRange(node.firstChild, null)
-
-    if (text != null) {
-      this.findPointIn(node, text.length)
-      this.text += text
-      // Chrome inserts two newlines when pressing shift-enter at the
-      // end of a line. This drops one of those.
-      if (browser.chrome && this.view.inputState.lastKeyCode == 13 && !node.nextSibling && /\n\n$/.test(this.text))
-        this.text = this.text.slice(0, -1)
-    }
-  }
-
-  findPointBefore(node: Node, next: Node | null) {
-    for (let point of this.points)
-      if (point.node == node && node.childNodes[point.offset] == next)
-        point.pos = this.text.length
-  }
-
-  findPointIn(node: Node, maxLen: number) {
-    for (let point of this.points)
-      if (point.node == node)
-        point.pos = this.text.length + Math.min(point.offset, maxLen)
-  }
-}
-
-function isBlockElement(node: Node): boolean {
-  return node.nodeType == 1 && /^(DIV|P|LI|UL|OL|BLOCKQUOTE|DD|DT|H\d|SECTION|PRE)$/.test(node.nodeName)
-}
-
-class DOMPoint {
-  pos: number = -1
-  constructor(readonly node: Node, readonly offset: number) {}
 }
 
 function selectionPoints(view: EditorView) {

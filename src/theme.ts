@@ -61,11 +61,16 @@ export const baseTheme = buildTheme("." + baseThemeID, {
     boxSizing: "border-box",
 
     padding: "4px 0",
-    outline: "none"
+    outline: "none",
+
+    "&[contenteditable=true]": {
+      WebkitUserModify: "read-write-plaintext-only",
+    }
   },
 
   ".cm-lineWrapping": {
-    whiteSpace: "pre-wrap",
+    whiteSpace_fallback: "pre-wrap", // For IE
+    whiteSpace: "break-spaces",
     wordBreak: "break-word", // For Safari, which doesn't support overflow-wrap: anywhere
     overflowWrap: "anywhere"
   },
@@ -114,11 +119,13 @@ export const baseTheme = buildTheme("." + baseThemeID, {
   "@keyframes cm-blink": {"0%": {}, "50%": {visibility: "hidden"}, "100%": {}},
   "@keyframes cm-blink2": {"0%": {}, "50%": {visibility: "hidden"}, "100%": {}},
 
-  ".cm-cursor": {
+  ".cm-cursor, .cm-dropCursor": {
     position: "absolute",
     borderLeft: "1.2px solid black",
     marginLeft: "-0.6px",
     pointerEvents: "none",
+  },
+  ".cm-cursor": {
     display: "none"
   },
   "&dark .cm-cursor": {
@@ -141,9 +148,15 @@ export const baseTheme = buildTheme("." + baseThemeID, {
     verticalAlign: "bottom"
   },
 
+  ".cm-widgetBuffer": {
+    verticalAlign: "text-bottom",
+    height: "1em",
+  },
+
   ".cm-placeholder": {
     color: "#888",
-    display: "inline-block"
+    display: "inline-block",
+    verticalAlign: "top",
   },
 
   ".cm-button": {
@@ -151,7 +164,7 @@ export const baseTheme = buildTheme("." + baseThemeID, {
     color: "inherit",
     fontSize: "70%",
     padding: ".2em 1em",
-    borderRadius: "3px"
+    borderRadius: "1px"
   },
 
   "&light .cm-button": {

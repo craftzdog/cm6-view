@@ -1,10 +1,11 @@
-import {EditorState, Transaction, ChangeSet, Facet, StateEffect, Extension, SelectionRange} from "@codemirror/state"
+import {EditorState, Transaction, ChangeSet, ChangeDesc, Facet,
+        StateEffect, Extension, SelectionRange} from "@codemirror/state"
 import {RangeSet} from "@codemirror/rangeset"
 import {StyleModule} from "style-mod"
 import {DecorationSet} from "./decoration"
 import {EditorView, DOMEventHandlers} from "./editorview"
-import {Attrs, combineAttrs} from "./attributes"
-import {Rect} from "./dom"
+import {Attrs} from "./attributes"
+import {Rect, ScrollStrategy} from "./dom"
 import {MakeSelectionStyle} from "./input"
 
 /// Command functions are used in key bindings and other types of user
@@ -28,9 +29,31 @@ export const updateListener = Facet.define<(update: ViewUpdate) => void>()
 
 export const inputHandler = Facet.define<(view: EditorView, from: number, to: number, text: string) => boolean>()
 
+// FIXME remove
 export const scrollTo = StateEffect.define<SelectionRange>({
   map: (range, changes) => range.map(changes)
 })
+
+// FIXME remove
+export const centerOn = StateEffect.define<SelectionRange>({
+  map: (range, changes) => range.map(changes)
+})
+
+export class ScrollTarget {
+  constructor(
+    readonly range: SelectionRange,
+    readonly y: ScrollStrategy = "nearest",
+    readonly x: ScrollStrategy = "nearest",
+    readonly yMargin: number = 5,
+    readonly xMargin: number = 5,
+  ) {}
+
+  map(changes: ChangeDesc) {
+    return changes.empty ? this : new ScrollTarget(this.range.map(changes), this.y, this.x, this.yMargin, this.xMargin)
+  }
+}
+
+export const scrollIntoView = StateEffect.define<ScrollTarget>({map: (t, ch) => t.map(ch)})
 
 /// Log or report an unhandled exception in client code. Should
 /// probably only be used by extension code that allows client code to
@@ -107,11 +130,13 @@ export class PluginField<T> {
   /// **Note**: For reasons of data flow (plugins are only updated
   /// after the viewport is computed), decorations produced by plugins
   /// are _not_ taken into account when predicting the vertical layout
-  /// structure of the editor. Thus, things like large widgets or big
-  /// replacements (i.e. code folding) should be provided through the
-  /// state-level [`decorations` facet](#view.EditorView^decorations),
-  /// not this plugin field. Specifically, replacing decorations that
-  /// cross line boundaries will break if provided through a plugin.
+  /// structure of the editor. They **must not** introduce block
+  /// widgets (that will raise an error) or replacing decorations that
+  /// cover line breaks (these will be ignored if they occur). Such
+  /// decorations, or others that cause a large amount of vertical
+  /// size shift compared to the undecorated content, should be
+  /// provided through the state-level [`decorations`
+  /// facet](#view.EditorView^decorations) instead.
   static decorations = PluginField.define<DecorationSet>()
 
   /// Used to provide ranges that should be treated as atoms as far as
@@ -213,29 +238,33 @@ export class PluginInstance {
   // initialized on the first update.
   value: PluginValue | null = null
 
-  constructor(readonly spec: ViewPlugin<any>) {}
+  constructor(public spec: ViewPlugin<any> | null) {}
 
   takeField<T>(type: PluginField<T>, target: T[]) {
-    for (let {field, get} of this.spec.fields) if (field == type) target.push(get(this.value))
+    if (this.spec) for (let {field, get} of this.spec.fields)
+      if (field == type) target.push(get(this.value))
   }
 
   update(view: EditorView) {
     if (!this.value) {
-      try { this.value = this.spec.create(view) }
-      catch (e) {
-        logException(view.state, e, "CodeMirror plugin crashed")
-        return PluginInstance.dummy
+      if (this.spec) {
+        try { this.value = this.spec.create(view) }
+        catch (e) {
+          logException(view.state, e, "CodeMirror plugin crashed")
+          this.deactivate()
+        }
       }
     } else if (this.mustUpdate) {
       let update = this.mustUpdate
       this.mustUpdate = null
-      if (!this.value.update) return this
-      try {
-        this.value.update(update)
-      } catch (e) {
-        logException(update.state, e, "CodeMirror plugin crashed")
-        if (this.value.destroy) try { this.value.destroy() } catch (_) {}
-        return PluginInstance.dummy
+      if (this.value.update) {
+        try {
+          this.value.update(update)
+        } catch (e) {
+          logException(update.state, e, "CodeMirror plugin crashed")
+          if (this.value.destroy) try { this.value.destroy() } catch (_) {}
+          this.deactivate()
+        }
       }
     }
     return this
@@ -248,7 +277,9 @@ export class PluginInstance {
     }
   }
 
-  static dummy = new PluginInstance(ViewPlugin.define(() => ({})))
+  deactivate() {
+    this.spec = this.value = null
+  }
 }
 
 export interface MeasureRequest<T> {
@@ -257,19 +288,17 @@ export interface MeasureRequest<T> {
   read(view: EditorView): T
   /// Called in a DOM write phase to update the document. Should _not_
   /// do anything that triggers DOM layout.
-  write(measure: T, view: EditorView): void
+  write?(measure: T, view: EditorView): void
   /// When multiple requests with the same key are scheduled, only the
   /// last one will actually be ran.
   key?: any
 }
 
-export const editorAttributes = Facet.define<Attrs, Attrs>({
-  combine: values => values.reduce((a, b) => combineAttrs(b, a), {})
-})
+export type AttrSource = Attrs | ((view: EditorView) => Attrs | null)
 
-export const contentAttributes = Facet.define<Attrs, Attrs>({
-  combine: values => values.reduce((a, b) => combineAttrs(b, a), {})
-})
+export const editorAttributes = Facet.define<AttrSource>()
+
+export const contentAttributes = Facet.define<AttrSource>()
 
 // Provide decorations
 export const decorations = Facet.define<DecorationSet>()
@@ -348,7 +377,6 @@ export class ViewUpdate {
       view.inputState.notifiedFocused = focus
       this.flags |= UpdateFlag.Focus
     }
-    if (this.docChanged) this.flags |= UpdateFlag.Height
   }
 
   /// Tells you whether the [viewport](#view.EditorView.viewport) or
@@ -358,13 +386,14 @@ export class ViewUpdate {
     return (this.flags & UpdateFlag.Viewport) > 0
   }
 
-  /// Indicates whether the line height in the editor changed in this update.
+  /// Indicates whether the height of an element in the editor changed
+  /// in this update.
   get heightChanged() {
     return (this.flags & UpdateFlag.Height) > 0
   }
 
-  /// Returns true when the document changed or the size of the editor
-  /// or the lines or characters within it has changed.
+  /// Returns true when the document was modified or the size of the
+  /// editor, or elements within the editor, changed.
   get geometryChanged() {
     return this.docChanged || (this.flags & (UpdateFlag.Geometry | UpdateFlag.Height)) > 0
   }
@@ -376,7 +405,7 @@ export class ViewUpdate {
 
   /// Whether the document changed in this update.
   get docChanged() {
-    return this.transactions.some(tr => tr.docChanged)
+    return !this.changes.empty
   }
 
   /// Whether the selection was explicitly set in this update.

@@ -1,19 +1,22 @@
 import {EditorState, Transaction, TransactionSpec, Extension, Prec, ChangeDesc,
-        EditorSelection, SelectionRange, StateEffect} from "@codemirror/state"
+        EditorSelection, SelectionRange, StateEffect, Facet} from "@codemirror/state"
 import {Line} from "@codemirror/text"
 import {StyleModule, StyleSpec} from "style-mod"
 
 import {DocView} from "./docview"
 import {ContentView} from "./contentview"
 import {InputState} from "./input"
-import {Rect, focusPreventScroll, flattenRect, contentEditablePlainTextSupported, getRoot} from "./dom"
+import {Rect, focusPreventScroll, flattenRect, getRoot, ScrollStrategy} from "./dom"
 import {posAtCoords, moveByChar, moveToLineBoundary, byGroup, moveVertically, skipAtoms} from "./cursor"
 import {BlockInfo} from "./heightmap"
 import {ViewState} from "./viewstate"
 import {ViewUpdate, styleModule,
-        contentAttributes, editorAttributes, clickAddsSelectionRange, dragMovesSelection, mouseSelectionStyle,
-        exceptionSink, updateListener, logException, viewPlugin, ViewPlugin, PluginInstance, PluginField,
-        decorations, MeasureRequest, editable, inputHandler, scrollTo, UpdateFlag} from "./extension"
+        contentAttributes, editorAttributes, AttrSource,
+        clickAddsSelectionRange, dragMovesSelection, mouseSelectionStyle,
+        exceptionSink, updateListener, logException,
+        viewPlugin, ViewPlugin, PluginInstance, PluginField,
+        decorations, MeasureRequest, editable, inputHandler,
+        scrollTo, centerOn, scrollIntoView, UpdateFlag, ScrollTarget} from "./extension"
 import {theme, darkTheme, buildTheme, baseThemeID, baseLightID, baseDarkID, lightDarkIDs, baseTheme} from "./theme"
 import {DOMObserver} from "./domobserver"
 import {Attrs, updateAttrs, combineAttrs} from "./attributes"
@@ -125,6 +128,7 @@ export class EditorView {
   public docView: DocView
 
   private plugins: PluginInstance[] = []
+  private pluginMap: Map<ViewPlugin<any>, PluginInstance | null> = new Map
   private editorAttrs: Attrs = {}
   private contentAttrs: Attrs = {}
   private styleModules!: readonly StyleModule[]
@@ -170,7 +174,8 @@ export class EditorView {
     this.root = (config.root || getRoot(config.parent) || document) as DocumentOrShadowRoot
 
     this.viewState = new ViewState(config.state || EditorState.create())
-    this.plugins = this.state.facet(viewPlugin).map(spec => new PluginInstance(spec).update(this))
+    this.plugins = this.state.facet(viewPlugin).map(spec => new PluginInstance(spec))
+    for (let plugin of this.plugins) plugin.update(this)
     this.observer = new DOMObserver(this, (from, to, typeOver) => {
       applyDOMChange(this, from, to, typeOver)
     }, event => {
@@ -231,18 +236,23 @@ export class EditorView {
       return this.setState(state)
 
     update = new ViewUpdate(this, state, transactions)
-    let scrollPos: SelectionRange | null = null
+    let scrollTarget = this.viewState.scrollTarget
     try {
       this.updateState = UpdateState.Updating
       for (let tr of transactions) {
-        if (scrollPos) scrollPos = scrollPos.map(tr.changes)
+        if (scrollTarget) scrollTarget = scrollTarget.map(tr.changes)
         if (tr.scrollIntoView) {
           let {main} = tr.state.selection
-          scrollPos = main.empty ? main : EditorSelection.cursor(main.head, main.head > main.anchor ? -1 : 1)
+          scrollTarget = new ScrollTarget(
+            main.empty ? main : EditorSelection.cursor(main.head, main.head > main.anchor ? -1 : 1))
         }
-        for (let e of tr.effects) if (e.is(scrollTo)) scrollPos = e.value
+        for (let e of tr.effects) {
+          if (e.is(scrollTo)) scrollTarget = new ScrollTarget(e.value)
+          else if (e.is(centerOn)) scrollTarget = new ScrollTarget(e.value, "center")
+          else if (e.is(scrollIntoView)) scrollTarget = e.value
+        }
       }
-      this.viewState.update(update, scrollPos)
+      this.viewState.update(update, scrollTarget)
       this.bidiCache = CachedOrder.update(this.bidiCache, update.changes)
       if (!update.empty) {
         this.updatePlugins(update)
@@ -252,8 +262,12 @@ export class EditorView {
       if (this.state.facet(styleModule) != this.styleModules) this.mountStyles()
       this.updateAttrs()
       this.showAnnouncements(transactions)
+      this.docView.updateSelection(redrawn, transactions.some(tr => tr.isUserEvent("select.pointer")))
     } finally { this.updateState = UpdateState.Idle }
-    if (redrawn || scrollPos || this.viewState.mustEnforceCursorAssoc) this.requestMeasure()
+    if (update.startState.facet(theme) != update.state.facet(theme))
+      this.viewState.mustMeasureContent = true
+    if (redrawn || scrollTarget || this.viewState.mustEnforceCursorAssoc || this.viewState.mustMeasureContent)
+      this.requestMeasure()
     if (!update.empty) for (let listener of this.state.facet(updateListener)) listener(update)
   }
 
@@ -270,16 +284,20 @@ export class EditorView {
       return
     }
     this.updateState = UpdateState.Updating
+    let hadFocus = this.hasFocus
     try {
       for (let plugin of this.plugins) plugin.destroy(this)
       this.viewState = new ViewState(newState)
-      this.plugins = newState.facet(viewPlugin).map(spec => new PluginInstance(spec).update(this))
+      this.plugins = newState.facet(viewPlugin).map(spec => new PluginInstance(spec))
+      this.pluginMap.clear()
+      for (let plugin of this.plugins) plugin.update(this)
       this.docView = new DocView(this)
       this.inputState.ensureHandlers(this)
       this.mountStyles()
       this.updateAttrs()
       this.bidiCache = []
     } finally { this.updateState = UpdateState.Idle }
+    if (hadFocus) this.focus()
     this.requestMeasure()
   }
 
@@ -299,19 +317,19 @@ export class EditorView {
       }
       for (let plugin of this.plugins) if (plugin.mustUpdate != update) plugin.destroy(this)
       this.plugins = newPlugins
+      this.pluginMap.clear()
       this.inputState.ensureHandlers(this)
     } else {
       for (let p of this.plugins) p.mustUpdate = update
     }
-    for (let i = 0; i < this.plugins.length; i++)
-      this.plugins[i] = this.plugins[i].update(this)
+    for (let i = 0; i < this.plugins.length; i++) this.plugins[i].update(this)
   }
 
   /// @internal
   measure(flush = true) {
     if (this.destroyed) return
     if (this.measureScheduled > -1) cancelAnimationFrame(this.measureScheduled)
-    this.measureScheduled = -1 // Prevent requestMeasure calls from scheduling another animation frame
+    this.measureScheduled = 0 // Prevent requestMeasure calls from scheduling another animation frame
 
     if (flush) this.observer.flush()
 
@@ -320,10 +338,12 @@ export class EditorView {
       for (let i = 0;; i++) {
         this.updateState = UpdateState.Measuring
         let oldViewport = this.viewport
-        let changed = this.viewState.measure(this.docView, i > 0)
-        if (!changed && !this.measureRequests.length && this.viewState.scrollTo == null) break
+        let changed = this.viewState.measure(this)
+        if (!changed && !this.measureRequests.length && this.viewState.scrollTarget == null) break
         if (i > 5) {
-          console.warn("Viewport failed to stabilize")
+          console.warn(this.measureRequests.length
+            ? "Measure loop restarted more than 5 times"
+            : "Viewport failed to stabilize")
           break
         }
         let measuring: MeasureRequest<any>[] = []
@@ -334,7 +354,7 @@ export class EditorView {
           try { return m.read(this) }
           catch(e) { logException(this.state, e); return BadMeasure }
         })
-        let update = new ViewUpdate(this, this.state)
+        let update = new ViewUpdate(this, this.state), redrawn = false, scrolled = false
         update.flags |= changed
         if (!updated) updated = update
         else updated.flags |= changed
@@ -342,22 +362,29 @@ export class EditorView {
         if (!update.empty) {
           this.updatePlugins(update)
           this.inputState.update(update)
+          this.updateAttrs()
+          redrawn = this.docView.update(update)
         }
-        this.updateAttrs()
-        if (changed) this.docView.update(update)
         for (let i = 0; i < measuring.length; i++) if (measured[i] != BadMeasure) {
-          try { measuring[i].write(measured[i], this) }
-          catch(e) { logException(this.state, e) }
+          try {
+            let m = measuring[i]
+            if (m.write) m.write(measured[i], this)
+          } catch(e) { logException(this.state, e) }
         }
-        if (this.viewState.scrollTo) {
-          this.docView.scrollRangeIntoView(this.viewState.scrollTo)
-          this.viewState.scrollTo = null
+        if (this.viewState.scrollTarget) {
+          this.docView.scrollIntoView(this.viewState.scrollTarget)
+          this.viewState.scrollTarget = null
+          scrolled = true
         }
-        if (this.viewport.from == oldViewport.from && this.viewport.to == oldViewport.to && this.measureRequests.length == 0) break
+        if (redrawn) this.docView.updateSelection(true)
+        if (this.viewport.from == oldViewport.from && this.viewport.to == oldViewport.to &&
+            !scrolled && this.measureRequests.length == 0) break
       }
-    } finally { this.updateState = UpdateState.Idle }
+    } finally {
+      this.updateState = UpdateState.Idle
+      this.measureScheduled = -1
+    }
 
-    this.measureScheduled = -1
     if (updated && !updated.empty) for (let listener of this.state.facet(updateListener)) listener(updated)
   }
 
@@ -369,24 +396,28 @@ export class EditorView {
   }
 
   private updateAttrs() {
-    let editorAttrs = combineAttrs(this.state.facet(editorAttributes), {
+    let editorAttrs = attrsFromFacet(this, editorAttributes, {
       class: "cm-editor" + (this.hasFocus ? " cm-focused " : " ") + this.themeClasses
     })
-    updateAttrs(this.dom, this.editorAttrs, editorAttrs)
-    this.editorAttrs = editorAttrs
     let contentAttrs: Attrs = {
       spellcheck: "false",
       autocorrect: "off",
       autocapitalize: "off",
-      contenteditable: !this.state.facet(editable) ? "false" : contentEditablePlainTextSupported() ? "plaintext-only" : "true",
+      translate: "no",
+      contenteditable: !this.state.facet(editable) ? "false" : "true",
       class: "cm-content",
       style: `${browser.tabSize}: ${this.state.tabSize}`,
       role: "textbox",
       "aria-multiline": "true"
     }
     if (this.state.readOnly) contentAttrs["aria-readonly"] = "true"
-    combineAttrs(this.state.facet(contentAttributes), contentAttrs)
-    updateAttrs(this.contentDOM, this.contentAttrs, contentAttrs)
+    attrsFromFacet(this, contentAttributes, contentAttrs)
+
+    this.observer.ignore(() => {
+      updateAttrs(this.contentDOM, this.contentAttrs, contentAttrs)
+      updateAttrs(this.dom, this.editorAttrs, editorAttrs)
+    })
+    this.editorAttrs = editorAttrs
     this.contentAttrs = contentAttrs
   }
 
@@ -444,8 +475,22 @@ export class EditorView {
   /// know you registered a given plugin, it is recommended to check
   /// the return value of this method.
   plugin<T>(plugin: ViewPlugin<T>): T | null {
-    for (let inst of this.plugins) if (inst.spec == plugin) return inst.update(this).value as T
-    return null
+    let known = this.pluginMap.get(plugin)
+    if (known === undefined || known && known.spec != plugin)
+      this.pluginMap.set(plugin, known = this.plugins.find(p => p.spec == plugin) || null)
+    return known && known.update(this).value as T
+  }
+
+  /// The top position of the document, in screen coordinates. This
+  /// may be negative when the editor is scrolled down. Points
+  /// directly to the top of the first line, not above the padding.
+  get documentTop() {
+    return this.contentDOM.getBoundingClientRect().top + this.viewState.paddingTop
+  }
+
+  /// Reports the padding above and below the document.
+  get documentPadding() {
+    return {top: this.viewState.paddingTop, bottom: this.viewState.paddingBottom}
   }
 
   /// Find the line or block widget at the given vertical position.
@@ -457,9 +502,19 @@ export class EditorView {
   /// position, or a precomputed document top
   /// (`view.contentDOM.getBoundingClientRect().top`) to limit layout
   /// queries.
+  ///
+  /// *Deprecated: use `elementAtHeight` instead.*
   blockAtHeight(height: number, docTop?: number) {
+    let top = ensureTop(docTop, this)
+    return this.elementAtHeight(height - top).moveY(top)
+  }
+
+  /// Find the text line or block widget at the given vertical
+  /// position (which is interpreted as relative to the [top of the
+  /// document](#view.EditorView.documentTop)
+  elementAtHeight(height: number) {
     this.readMeasured()
-    return this.viewState.blockAtHeight(height, ensureTop(docTop, this.contentDOM))
+    return this.viewState.elementAtHeight(height)
   }
 
   /// Find information for the visual line (see
@@ -471,18 +526,38 @@ export class EditorView {
   /// Defaults to treating `height` as a screen position. See
   /// [`blockAtHeight`](#view.EditorView.blockAtHeight) for the
   /// interpretation of the `docTop` parameter.
+  ///
+  /// *Deprecated: use `lineBlockAtHeight` instead.*
   visualLineAtHeight(height: number, docTop?: number): BlockInfo {
+    let top = ensureTop(docTop, this)
+    return this.lineBlockAtHeight(height - top).moveY(top)
+  }
+
+  /// Find the line block (see
+  /// [`lineBlockAt`](#view.EditorView.lineBlockAt) at the given
+  /// height.
+  lineBlockAtHeight(height: number): BlockInfo {
     this.readMeasured()
-    return this.viewState.lineAtHeight(height, ensureTop(docTop, this.contentDOM))
+    return this.viewState.lineBlockAtHeight(height)
   }
 
   /// Iterate over the height information of the visual lines in the
   /// viewport. The heights of lines are reported relative to the
   /// given document top, which defaults to the screen position of the
   /// document (forcing a layout).
+  ///
+  /// *Deprecated: use `viewportLineBlocks` instead.*
   viewportLines(f: (line: BlockInfo) => void, docTop?: number) {
-    let {from, to} = this.viewport
-    this.viewState.forEachLine(from, to, f, ensureTop(docTop, this.contentDOM))
+    let top = ensureTop(docTop, this)
+    for (let line of this.viewportLineBlocks) f(line.moveY(top))
+  }
+
+  /// Get the extent and vertical position of all [line
+  /// blocks](#view.EditorView.lineBlockAt) in the viewport. Positions
+  /// are relative to the [top of the
+  /// document](#view.EditorView.documentTop);
+  get viewportLineBlocks() {
+    return this.viewState.viewportLines
   }
 
   /// Find the extent and height of the visual line (a range delimited
@@ -493,8 +568,20 @@ export class EditorView {
   /// argument, which defaults to 0 for this method. You can pass
   /// `view.contentDOM.getBoundingClientRect().top` here to get screen
   /// coordinates.
+  ///
+  /// *Deprecated: use `lineBlockAt` instead.*
   visualLineAt(pos: number, docTop: number = 0): BlockInfo {
-    return this.viewState.lineAt(pos, docTop)
+    return this.lineBlockAt(pos).moveY(docTop + this.viewState.paddingTop)
+  }
+
+  /// Find the line block around the given document position. A line
+  /// block is a range delimited on both sides by either a
+  /// non-[hidden](#view.Decoration^range) line breaks, or the
+  /// start/end of the document. It will usually just hold a line of
+  /// text, but may be broken into multiple textblocks by block
+  /// widgets.
+  lineBlockAt(pos: number): BlockInfo {
+    return this.viewState.lineBlockAt(pos)
   }
 
   /// The editor's total content height.
@@ -551,15 +638,19 @@ export class EditorView {
     return skipAtoms(this, start, moveVertically(this, start, forward, distance))
   }
 
-  /// Scroll the given document position into view.
+  // FIXME remove on next major version
   scrollPosIntoView(pos: number) {
-    this.viewState.scrollTo = EditorSelection.cursor(pos)
-    this.requestMeasure()
+    this.dispatch({effects: scrollTo.of(EditorSelection.cursor(pos))})
   }
 
   /// Find the DOM parent node and offset (child offset if `node` is
   /// an element, character offset when it is a text node) at the
   /// given document position.
+  ///
+  /// Note that for positions that aren't currently in
+  /// `visibleRanges`, the resulting DOM position isn't necessarily
+  /// meaningful (it may just point before or after a placeholder
+  /// element).
   domAtPos(pos: number): {node: Node, offset: number} {
     return this.docView.domAtPos(pos)
   }
@@ -571,8 +662,11 @@ export class EditorView {
     return this.docView.posFromDOM(node, offset)
   }
 
-  /// Get the document position at the given screen coordinates.
-  /// Returns null if no valid position could be found.
+  /// Get the document position at the given screen coordinates. For
+  /// positions not covered by the visible viewport's DOM structure,
+  /// this will return null, unless `false` is passed as second
+  /// argument, in which case it'll return an estimated position that
+  /// would be near the coordinates if it were rendered.
   posAtCoords(coords: {x: number, y: number}, precise: false): number
   posAtCoords(coords: {x: number, y: number}): number | null
   posAtCoords(coords: {x: number, y: number}, precise = true): number | null {
@@ -663,7 +757,40 @@ export class EditorView {
 
   /// Effect that can be [added](#state.TransactionSpec.effects) to a
   /// transaction to make it scroll the given range into view.
+  ///
+  /// *Deprecated*. Use [`scrollIntoView`](#view.EditorView^scrollIntoView) instead.
   static scrollTo = scrollTo
+
+  /// Effect that makes the editor scroll the given range to the
+  /// center of the visible view.
+  ///
+  /// *Deprecated*. Use [`scrollIntoView`](#view.EditorView^scrollIntoView) instead.
+  static centerOn = centerOn
+
+  /// Returns an effect that can be
+  /// [added](#state.TransactionSpec.effects) to a transaction to
+  /// cause it to scroll the given position or range into view.
+  static scrollIntoView(pos: number | SelectionRange, options: {
+    /// By default (`"nearest"`) the position will be vertically
+    /// scrolled only the minimal amount required to move the given
+    /// position into view. You can set this to `"start"` to move it
+    /// to the top of the view, `"end"` to move it to the bottom, or
+    /// `"center"` to move it to the center.
+    y?: ScrollStrategy,
+    /// Effect similar to
+    /// [`y`](#view.EditorView^scrollIntoView^options.y), but for the
+    /// horizontal scroll position.
+    x?: ScrollStrategy,
+    /// Extra vertical distance to add when moving something into
+    /// view. Not used with the `"center"` strategy. Defaults to 5.
+    yMargin?: number,
+    /// Extra horizontal distance to add. Not used with the `"center"`
+    /// strategy. Defaults to 5.
+    xMargin?: number,
+  } = {}): StateEffect<unknown> {
+    return scrollIntoView.of(new ScrollTarget(typeof pos == "number" ? EditorSelection.cursor(pos) : pos,
+                                              options.y, options.x, options.yMargin, options.xMargin))
+  }
 
   /// Facet to add a [style
   /// module](https://github.com/marijnh/style-mod#documentation) to
@@ -757,13 +884,19 @@ export class EditorView {
     return result
   }
 
+  /// This facet records whether a dark theme is active. The extension
+  /// returned by [`theme`](#view.EditorView^theme) automatically
+  /// includes an instance of this when the `dark` option is set to
+  /// true.
+  static darkTheme = darkTheme
+
   /// Create an extension that adds styles to the base theme. Like
   /// with [`theme`](#view.EditorView^theme), use `&` to indicate the
   /// place of the editor wrapper element when directly targeting
   /// that. You can also use `&dark` or `&light` instead to only
   /// target editors with a dark or light theme.
   static baseTheme(spec: {[selector: string]: StyleSpec}): Extension {
-    return Prec.fallback(styleModule.of(buildTheme("." + baseThemeID, spec, lightDarkIDs)))
+    return Prec.lowest(styleModule.of(buildTheme("." + baseThemeID, spec, lightDarkIDs)))
   }
 
   /// Facet that provides additional DOM attributes for the editor's
@@ -805,8 +938,9 @@ export type DOMEventHandlers<This> = {
 // Maximum line length for which we compute accurate bidi info
 const MaxBidiLine = 4096
 
-function ensureTop(given: number | undefined, dom: HTMLElement) {
-  return given == null ? dom.getBoundingClientRect().top : given
+// FIXME remove this and its callers on next breaking release
+function ensureTop(given: number | undefined, view: EditorView) {
+  return (given == null ? view.contentDOM.getBoundingClientRect().top : given) + view.viewState.paddingTop
 }
 
 let registeredGlobalHandler = false, resizeDebounce = -1
@@ -847,4 +981,12 @@ class CachedOrder {
     }
     return result
   }
+}
+
+function attrsFromFacet(view: EditorView, facet: Facet<AttrSource>, base: Attrs) {
+  for (let sources = view.state.facet(facet), i = sources.length - 1; i >= 0; i--) {
+    let source = sources[i], value = typeof source == "function" ? source(view) : source
+    if (value) combineAttrs(value, base)
+  }
+  return base
 }

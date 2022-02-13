@@ -1,7 +1,8 @@
 import {SpanIterator, RangeSet} from "@codemirror/rangeset"
 import {DecorationSet, Decoration, PointDecoration, LineDecoration, MarkDecoration, BlockType, WidgetType} from "./decoration"
+import {ContentView} from "./contentview"
 import {BlockView, LineView, BlockWidgetView} from "./blockview"
-import {InlineView, WidgetView, TextView, MarkView, WidgetBufferView} from "./inlineview"
+import {WidgetView, TextView, MarkView, WidgetBufferView} from "./inlineview"
 import {Text, TextIterator} from "@codemirror/text"
 
 const enum T { Chunk = 512 }
@@ -22,7 +23,7 @@ export class ContentBuilder implements SpanIterator<Decoration> {
   skip: number
   textOff: number = 0
 
-  constructor(private doc: Text, public pos: number, public end: number) {
+  constructor(private doc: Text, public pos: number, public end: number, readonly disallowBlockEffectsBelow: number) {
     this.cursor = doc.iter()
     this.skip = pos
   }
@@ -81,7 +82,7 @@ export class ContentBuilder implements SpanIterator<Decoration> {
         }
       }
       let take = Math.min(this.text.length - this.textOff, length, T.Chunk)
-      this.flushBuffer(active)
+      this.flushBuffer(active.slice(0, openStart))
       this.getLine().append(wrapMarks(new TextView(this.text.slice(this.textOff, this.textOff + take)), active), openStart)
       this.atCursorPos = true
       this.textOff += take
@@ -136,9 +137,19 @@ export class ContentBuilder implements SpanIterator<Decoration> {
     if (this.openStart < 0) this.openStart = openStart
   }
 
-  static build(text: Text, from: number, to: number, decorations: readonly DecorationSet[]):
+  filterPoint(from: number, to: number, value: Decoration, index: number) {
+    if (index < this.disallowBlockEffectsBelow && value instanceof PointDecoration) {
+      if (value.block)
+        throw new RangeError("Block decorations may not be specified via plugins")
+      if (to > this.doc.lineAt(this.pos).to)
+        throw new RangeError("Decorations that replace line breaks may not be specified via plugins")
+    }
+    return true
+  }
+
+  static build(text: Text, from: number, to: number, decorations: readonly DecorationSet[], pluginDecorationLength: number):
     {content: BlockView[], breakAtStart: number, openStart: number, openEnd: number} {
-    let builder = new ContentBuilder(text, from, to)
+    let builder = new ContentBuilder(text, from, to, pluginDecorationLength)
     builder.openEnd = RangeSet.spans(decorations, from, to, builder)
     if (builder.openStart < 0) builder.openStart = builder.openEnd
     builder.finish(builder.openEnd)
@@ -146,7 +157,7 @@ export class ContentBuilder implements SpanIterator<Decoration> {
   }
 }
 
-function wrapMarks(view: InlineView, active: readonly MarkDecoration[]) {
+function wrapMarks(view: ContentView, active: readonly MarkDecoration[]) {
   for (let mark of active) view = new MarkView(mark, [view], view.length)
   return view
 }

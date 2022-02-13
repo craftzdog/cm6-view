@@ -16,20 +16,7 @@ export class InputState {
   // On iOS, some keys need to have their default behavior happen
   // (after which we retroactively handle them and reset the DOM) to
   // avoid messing up the virtual keyboard state.
-  //
-  // On Chrome Android, backspace near widgets is just completely
-  // broken, and there are no key events, so we need to handle the
-  // beforeinput event. Deleting stuff will often create a flurry of
-  // events, and interrupting it before it is done just makes
-  // subsequent events even more broken, so again, we hold off doing
-  // anything until the browser is finished with whatever it is trying
-  // to do.
-  //
-  // setPendingKey sets this, causing the DOM observer to pause for a
-  // bit, and setting an animation frame (which seems the most
-  // reliable way to detect 'browser is done flailing') to fire a fake
-  // key event and re-sync the view again.
-  pendingKey: undefined | {key: string, keyCode: number} = undefined
+  pendingIOSKey: undefined | {key: string, keyCode: number} = undefined
 
   lastSelectionOrigin: string | null = null
   lastSelectionTime: number = 0
@@ -99,19 +86,12 @@ export class InputState {
 
   runCustomHandlers(type: string, view: EditorView, event: Event): boolean {
     for (let set of this.customHandlers) {
-      let handler = set.handlers[type], handled: boolean | void = false
+      let handler = set.handlers[type]
       if (handler) {
         try {
-          handled = handler.call(set.plugin, event as any, view)
+          if (handler.call(set.plugin, event as any, view) || event.defaultPrevented) return true
         } catch (e) {
           logException(view.state, e)
-        }
-        if (handled || event.defaultPrevented) {
-          // Chrome for Android often applies a bunch of nonsensical
-          // DOM changes after an enter press, even when
-          // preventDefault-ed. This tries to ignore those.
-          if (browser.android && type == "keydown" && (event as any).keyCode == 13) view.observer.flushSoon()
-          return true
         }
       }
     }
@@ -133,6 +113,16 @@ export class InputState {
     this.lastKeyCode = event.keyCode
     this.lastKeyTime = Date.now()
     if (this.screenKeyEvent(view, event as KeyboardEvent)) return true
+    // Chrome for Android usually doesn't fire proper key events, but
+    // occasionally does, usually surrounded by a bunch of complicated
+    // composition changes. When an enter or backspace key event is
+    // seen, hold off on handling DOM events for a bit, and then
+    // dispatch it.
+    if (browser.android && browser.chrome && !(event as any).synthetic &&
+        (event.keyCode == 13 || event.keyCode == 8)) {
+      view.observer.delayAndroidKey(event.key, event.keyCode)
+      return true
+    }
     // Prevent the default behavior of Enter on iOS makes the
     // virtual keyboard get stuck in the wrong (lowercase)
     // state. So we let it go through, and then, in
@@ -141,23 +131,18 @@ export class InputState {
     let pending
     if (browser.ios && (pending = PendingKeys.find(key => key.keyCode == event.keyCode)) &&
         !(event.ctrlKey || event.altKey || event.metaKey) && !(event as any).synthetic) {
-      this.setPendingKey(view, pending)
+      this.pendingIOSKey = pending
+      setTimeout(() => this.flushIOSKey(view), 250)
       return true
     }
     return false
   }
 
-  setPendingKey(view: EditorView, pending: {key: string, keyCode: number}) {
-    this.pendingKey = pending
-    requestAnimationFrame(() => {
-      if (!this.pendingKey) return false
-      let key = this.pendingKey
-      this.pendingKey = undefined
-      view.observer.processRecords()
-      let startState = view.state
-      dispatchKey(view.contentDOM, key.key, key.keyCode)
-      if (view.state == startState) view.docView.reset(true)
-    })
+  flushIOSKey(view: EditorView) {
+    let key = this.pendingIOSKey
+    if (!key) return false
+    this.pendingIOSKey = undefined
+    return dispatchKey(view.contentDOM, key.key, key.keyCode)
   }
 
   ignoreDuringComposition(event: Event): boolean {
@@ -188,9 +173,9 @@ export class InputState {
       event.type == "compositionend" && !browser.ios
   }
 
-  startMouseSelection(view: EditorView, event: MouseEvent, style: MouseSelectionStyle) {
+  startMouseSelection(mouseSelection: MouseSelection) {
     if (this.mouseSelection) this.mouseSelection.destroy()
-    this.mouseSelection = new MouseSelection(this, view, event, style)
+    this.mouseSelection = mouseSelection
   }
 
   update(update: ViewUpdate) {
@@ -248,9 +233,10 @@ class MouseSelection {
   multiple: boolean
   lastEvent: MouseEvent
 
-  constructor(private inputState: InputState, private view: EditorView,
+  constructor(private view: EditorView,
               startEvent: MouseEvent,
-              private style: MouseSelectionStyle) {
+              private style: MouseSelectionStyle,
+              private mustSelect: boolean) {
     this.lastEvent = startEvent
     let doc = view.contentDOM.ownerDocument!
     doc.addEventListener("mousemove", this.move = this.move.bind(this))
@@ -259,7 +245,7 @@ class MouseSelection {
     this.extend = startEvent.shiftKey
     this.multiple = view.state.facet(EditorState.allowMultipleSelections) && addsSelectionRange(view, startEvent)
     this.dragMove = dragMovesSelection(view, startEvent)
-    this.dragging = isInPrimarySelection(view, startEvent) ? null : false
+    this.dragging = isInPrimarySelection(view, startEvent) && getClickType(startEvent) == 1 ? null : false
     // When clicking outside of the selection, immediately apply the
     // effect of starting the selection
     if (this.dragging === false) {
@@ -284,17 +270,19 @@ class MouseSelection {
     let doc = this.view.contentDOM.ownerDocument!
     doc.removeEventListener("mousemove", this.move)
     doc.removeEventListener("mouseup", this.up)
-    this.inputState.mouseSelection = null
+    this.view.inputState.mouseSelection = null
   }
 
   select(event: MouseEvent) {
     let selection = this.style.get(event, this.extend, this.multiple)
-    if (!selection.eq(this.view.state.selection) || selection.main.assoc != this.view.state.selection.main.assoc)
+    if (this.mustSelect || !selection.eq(this.view.state.selection) ||
+        selection.main.assoc != this.view.state.selection.main.assoc)
       this.view.dispatch({
         selection,
         userEvent: "select.pointer",
         scrollIntoView: true
       })
+    this.mustSelect = false
   }
 
   update(update: ViewUpdate) {
@@ -405,7 +393,7 @@ handlers.touchmove = view => {
 
 handlers.mousedown = (view, event: MouseEvent) => {
   view.observer.flush()
-  if (lastTouch > Date.now() - 2000) return // Ignore touch interaction
+  if (lastTouch > Date.now() - 2000 && getClickType(event) == 1) return // Ignore touch interaction
   let style: MouseSelectionStyle | null = null
   for (let makeStyle of view.state.facet(mouseSelectionStyle)) {
     style = makeStyle(view, event)
@@ -413,8 +401,9 @@ handlers.mousedown = (view, event: MouseEvent) => {
   }
   if (!style && event.button == 0) style = basicMouseSelection(view, event)
   if (style) {
-    if (view.root.activeElement != view.contentDOM) view.observer.ignore(() => focusPreventScroll(view.contentDOM))
-    view.inputState.startMouseSelection(view, event, style)
+    let mustFocus = view.root.activeElement != view.contentDOM
+    if (mustFocus) view.observer.ignore(() => focusPreventScroll(view.contentDOM))
+    view.inputState.startMouseSelection(new MouseSelection(view, event, style, mustFocus))
   }
 }
 
@@ -478,7 +467,7 @@ function basicMouseSelection(view: EditorView, event: MouseEvent) {
   let last = start, lastEvent: MouseEvent | null = event
   return {
     update(update) {
-      if (update.changes) {
+      if (update.docChanged) {
         if (start) start.pos = update.changes.mapPos(start.pos)
         startSel = startSel.map(update.changes)
         lastEvent = null
@@ -517,9 +506,8 @@ handlers.dragstart = (view, event: DragEvent) => {
 }
 
 function dropText(view: EditorView, event: DragEvent, text: string, direct: boolean) {
-  let dropPos = view.posAtCoords({x: event.clientX, y: event.clientY})
-  if (dropPos == null || !text) return
-
+  if (!text) return
+  let dropPos = view.posAtCoords({x: event.clientX, y: event.clientY}, false)
   event.preventDefault()
 
   let {mouseSelection} = view.inputState
@@ -664,12 +652,12 @@ handlers.compositionstart = handlers.compositionupdate = view => {
   if (view.inputState.compositionFirstChange == null)
     view.inputState.compositionFirstChange = true
   if (view.inputState.composing < 0) {
+    // FIXME possibly set a timeout to clear it again on Android
+    view.inputState.composing = 0
     if (view.docView.compositionDeco.size) {
       view.observer.flush()
       forceClearComposition(view, true)
     }
-    // FIXME possibly set a timeout to clear it again on Android
-    view.inputState.composing = 0
   }
 }
 
@@ -696,16 +684,18 @@ handlers.beforeinput = (view, event) => {
   // seems to do nothing at all on Chrome).
   let pending
   if (browser.chrome && browser.android && (pending = PendingKeys.find(key => key.inputType == event.inputType))) {
-    view.inputState.setPendingKey(view, pending)
-    let startViewHeight = window.visualViewport?.height || 0
-    setTimeout(() => {
-      // Backspacing near uneditable nodes on Chrome Android sometimes
-      // closes the virtual keyboard. This tries to crudely detect
-      // that and refocus to get it back.
-      if ((window.visualViewport?.height || 0) > startViewHeight + 10 && view.hasFocus) {
-        view.contentDOM.blur()
-        view.focus()
-      }
-    }, 50)
+    view.observer.delayAndroidKey(pending.key, pending.keyCode)
+    if (pending.key == "Backspace" || pending.key == "Delete") {
+      let startViewHeight = window.visualViewport?.height || 0
+      setTimeout(() => {
+        // Backspacing near uneditable nodes on Chrome Android sometimes
+        // closes the virtual keyboard. This tries to crudely detect
+        // that and refocus to get it back.
+        if ((window.visualViewport?.height || 0) > startViewHeight + 10 && view.hasFocus) {
+          view.contentDOM.blur()
+          view.focus()
+        }
+      }, 100)
+    }
   }
 }
